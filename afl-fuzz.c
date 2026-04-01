@@ -388,6 +388,7 @@ u32 state_count = 0; /* Number of states in the state sequence */
 
 /* flags */
 u8 use_net = 0;
+u8 extern_send = 0;          /* External send/recv via fastdyn hooks (-Y) */
 u8 poll_wait = 0;
 u8 server_wait = 0;
 u8 socket_timeout = 0;
@@ -984,6 +985,85 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
 
 }
 
+/* Send mutated messages via fastdyn hooks instead of a real socket.
+   Used when -Y is given; no IP/port/protocol needed. */
+static int send_over_fastdyn()
+{
+  static uint8_t recv_buf[65536];
+  u8 likely_buggy = 0;
+
+  if (cleanup_script) system(cleanup_script);
+  //usleep(server_wait_usecs); // we shouldn't need to wait if this is launched after the server, and then it does its own snapshotting to restore
+
+  if (response_buf) {
+    ck_free(response_buf);
+    response_buf = NULL;
+    response_buf_size = 0;
+  }
+
+  if (response_bytes) {
+    ck_free(response_bytes);
+    response_bytes = NULL;
+  }
+
+  kliter_t(lms) *it;
+  messages_sent = 0;
+
+  for (it = kl_begin(kl_messages); it != kl_end(kl_messages); it = kl_next(it)) {
+    int n = fastdyn_send(kl_val(it)->mdata, kl_val(it)->msize);
+    messages_sent++;
+
+    response_bytes = (u32 *) ck_realloc(response_bytes, messages_sent * sizeof(u32));
+
+    if (n != (int)kl_val(it)->msize) goto FASTDYN_HANDLE_RESPONSES;
+
+    u32 prev_buf_size = response_buf_size;
+    int rn = fastdyn_recv(recv_buf, sizeof(recv_buf), poll_wait_msecs);
+    if (rn > 0) {
+      response_buf = (char *) ck_realloc(response_buf, response_buf_size + rn + 1);
+      memcpy(response_buf + response_buf_size, recv_buf, rn);
+      response_buf_size += rn;
+      response_buf[response_buf_size] = '\0';
+    } else if (rn < 0) {
+      goto FASTDYN_HANDLE_RESPONSES;
+    }
+
+    response_bytes[messages_sent - 1] = response_buf_size;
+
+    if (prev_buf_size == response_buf_size) likely_buggy = 1;
+    else likely_buggy = 0;
+  }
+
+FASTDYN_HANDLE_RESPONSES:
+  {
+    int rn = fastdyn_recv(recv_buf, sizeof(recv_buf), poll_wait_msecs);
+    if (rn > 0) {
+      response_buf = (char *) ck_realloc(response_buf, response_buf_size + rn + 1);
+      memcpy(response_buf + response_buf_size, recv_buf, rn);
+      response_buf_size += rn;
+      response_buf[response_buf_size] = '\0';
+    }
+  }
+
+  if (messages_sent > 0 && response_bytes != NULL)
+    response_bytes[messages_sent - 1] = response_buf_size;
+
+  memset(session_virgin_bits, 255, MAP_SIZE);
+  while(1 && 0) {
+    if (has_new_bits(session_virgin_bits) != 2) break;
+  }
+
+  if (likely_buggy && false_negative_reduction) return 0;
+
+  if (terminate_child && (child_pid > 0)) kill(child_pid, SIGTERM);
+  while(1 && 0) {
+    int status = kill(child_pid, 0);
+    if ((status != 0) && (errno == ESRCH)) break;
+  }
+
+  return 0;
+}
+
 /* Send (mutated) messages in order to the server under test */
 int send_over_network()
 {
@@ -1122,6 +1202,12 @@ HANDLE_RESPONSES:
   }
 
   return 0;
+}
+
+/* Dispatch to the appropriate send implementation based on active flags. */
+static void send_inputs(void) {
+  if (extern_send) send_over_fastdyn();
+  else if (use_net) send_over_network();
 }
 /* End of AFLNet-specific variables & functions */
 
@@ -3185,7 +3271,7 @@ static u8 run_target(char** argv, u32 timeout) {
     it.it_value.tv_usec = (timeout % 1000) * 1000;
     setitimer(ITIMER_REAL, &it, NULL);
 
-    if (use_net) send_over_network();
+    send_inputs();
 
     /* No process exit status to collect; fold into normal FAULT_NONE path.
        Timeout is still detectable via child_timed_out (set by SIGALRM). */
@@ -3324,11 +3410,11 @@ static u8 run_target(char** argv, u32 timeout) {
   /* The SIGALRM handler simply kills the child_pid and sets child_timed_out. */
 
   if (dumb_mode == 1 || no_forkserver) {
-    if (use_net) send_over_network();
+    send_inputs();
     if (waitpid(child_pid, &status, 0) <= 0) PFATAL("waitpid() failed");
 
   } else {
-    if (use_net) send_over_network();
+    send_inputs();
     s32 res;
 
     if ((res = read(fsrv_st_fd, &status, 4)) != 4) {
@@ -8887,7 +8973,7 @@ int main(int argc, char** argv) {
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:b:h:X")) > 0)
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:b:h:XY")) > 0)
 
     switch (opt) {
 
@@ -9044,6 +9130,12 @@ int main(int argc, char** argv) {
 
         if (extern_cov) FATAL("Multiple -X options not supported");
         extern_cov = 1;
+        break;
+
+      case 'Y': /* external send/recv via fastdyn hooks */
+
+        if (extern_send) FATAL("Multiple -Y options not supported");
+        extern_send = 1;
         break;
 
       case 'T': /* banner */
@@ -9219,7 +9311,7 @@ int main(int argc, char** argv) {
   }
 
   //AFLNet - Check for required arguments
-  if (!use_net) FATAL("Please specify network information of the server under test (e.g., tcp://127.0.0.1/8554)");
+  if (!use_net && !extern_send) FATAL("Please specify network information of the server under test (e.g., tcp://127.0.0.1/8554)");
 
   if (!protocol_selected) FATAL("Please specify the protocol to be tested using the -P option");
 

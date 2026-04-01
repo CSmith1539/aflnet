@@ -1,10 +1,12 @@
 #include "afl-fastdyn.h"
 
 int fastdyn_send(uint8_t *input, size_t size) {
+    printf("---------- Sending Input ---------------\n");
     return 0;
 }
 
 int fastdyn_recv(uint8_t *buffer, size_t size, uint32_t timeout) {
+    printf("---------- Receiving Input ---------------\n");
     return 0;
 }
 
