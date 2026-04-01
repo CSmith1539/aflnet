@@ -69,6 +69,7 @@
 #include <sys/capability.h>
 
 #include "aflnet.h"
+#include "afl-fastdyn.h"
 #include <graphviz/gvc.h>
 #include <math.h>
 
@@ -150,6 +151,8 @@ static s32 out_fd,                    /* Persistent fd for out_file       */
 static s32 forksrv_pid,               /* PID of the fork server           */
            child_pid = -1,            /* PID of the fuzzed program        */
            out_dir_fd = -1;           /* FD of the lock file              */
+
+static s32 initial_snapshot = -1;     /* Snapshot handle for extern_cov mode */
 
 EXP_ST u8* trace_bits;                /* SHM with instrumentation bitmap  */
 
@@ -3163,6 +3166,42 @@ static u8 run_target(char** argv, u32 timeout) {
   memset(trace_bits, 0, MAP_SIZE);
   MEM_BARRIER();
 
+  /* In extern_cov mode the target process is managed externally. We use
+     the fastdyn snapshot API to reset its state instead of fork/exec. */
+
+// TODO: work this in to the following if/else better
+  if (extern_cov) {
+
+    if (initial_snapshot == -1) {
+      initial_snapshot = fastdyn_snap();
+      if (initial_snapshot < 0) FATAL("fastdyn_snap() failed");
+    } else {
+      if (fastdyn_snap_restore(initial_snapshot) < 0)
+        FATAL("fastdyn_snap_restore() failed");
+    }
+
+    /* Configure timeout before sending, same as normal path. */
+    it.it_value.tv_sec  = (timeout / 1000);
+    it.it_value.tv_usec = (timeout % 1000) * 1000;
+    setitimer(ITIMER_REAL, &it, NULL);
+
+    if (use_net) send_over_network();
+
+    /* No process exit status to collect; fold into normal FAULT_NONE path.
+       Timeout is still detectable via child_timed_out (set by SIGALRM). */
+    status = 0;
+
+    getitimer(ITIMER_REAL, &it);
+    exec_ms = (u64) timeout - (it.it_value.tv_sec * 1000 +
+                               it.it_value.tv_usec / 1000);
+    it.it_value.tv_sec = 0;
+    it.it_value.tv_usec = 0;
+    setitimer(ITIMER_REAL, &it, NULL);
+
+    goto extern_cov_wait_done;
+
+  }
+
   /* If we're running in "dumb" mode, we can't rely on the fork server
      logic compiled into the target program, so we will just keep calling
      execve(). There is a bit of code duplication between here and
@@ -3312,6 +3351,8 @@ static u8 run_target(char** argv, u32 timeout) {
 
   setitimer(ITIMER_REAL, &it, NULL);
 
+extern_cov_wait_done:
+
   total_execs++;
 
   /* Any subsequent operations on trace_bits must not be moved by the
@@ -3413,7 +3454,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   /* Make sure the forkserver is up before we do anything, and let's not
      count its spin-up time toward binary calibration. */
 
-  if (dumb_mode != 1 && !no_forkserver && !forksrv_pid)
+  if (dumb_mode != 1 && !no_forkserver && !extern_cov && !forksrv_pid)
     init_forkserver(argv);
 
   if (q->exec_cksum) memcpy(first_trace, trace_bits, MAP_SIZE);
@@ -7818,6 +7859,13 @@ static void handle_skipreq(int sig) {
 
 static void handle_timeout(int sig) {
 
+  if (extern_cov) {
+    /* Process is externally managed; just flag the timeout and let
+       the network I/O layer (poll/send timeouts) unblock naturally. */
+    child_timed_out = 1;
+    return;
+  }
+
   if (child_pid > 0) {
 
     child_timed_out = 1;
@@ -9166,7 +9214,9 @@ int main(int argc, char** argv) {
 
     }
 
-  if (optind == argc || !in_dir || !out_dir) usage(argv[0]);
+  if ((!extern_cov && optind == argc) || !in_dir || !out_dir) {
+    usage(argv[0]);
+  }
 
   //AFLNet - Check for required arguments
   if (!use_net) FATAL("Please specify network information of the server under test (e.g., tcp://127.0.0.1/8554)");
@@ -9225,7 +9275,7 @@ int main(int argc, char** argv) {
 
   save_cmdline(argc, argv);
 
-  fix_up_banner(argv[optind]);
+  fix_up_banner(extern_cov ? (u8*)"(external)" : argv[optind]);
 
   check_if_tty();
 
@@ -9260,7 +9310,7 @@ int main(int argc, char** argv) {
 
   if (!out_file) setup_stdio_file();
 
-  check_binary(argv[optind]);
+  if (!extern_cov) check_binary(argv[optind]);
 
   start_time = get_cur_time();
 
@@ -9564,6 +9614,8 @@ stop_fuzzing:
   destroy_queue();
   destroy_extras();
   ck_free(target_path);
+
+  if (extern_cov && initial_snapshot >= 0) fastdyn_snap_free(initial_snapshot);
   ck_free(sync_id);
 
   destroy_ipsm();

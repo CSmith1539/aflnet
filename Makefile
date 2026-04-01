@@ -69,8 +69,8 @@ afl-as: afl-as.c afl-as.h $(COMM_HDR) | test_x86
 	$(CC) $(CFLAGS) $@.c -o $@ $(LDFLAGS)
 	ln -sf afl-as as
 
-afl-fuzz: afl-fuzz.c $(COMM_HDR) aflnet.o aflnet.h | test_x86
-	$(CC) $(CFLAGS) $@.c aflnet.o -o $@ $(LDFLAGS)
+afl-fuzz: afl-fuzz.c $(COMM_HDR) aflnet.o aflnet.h afl-fastdyn.o afl-fastdyn.h | test_x86
+	$(CC) $(CFLAGS) $@.c aflnet.o afl-fastdyn.o -o $@ $(LDFLAGS)
 
 afl-replay: afl-replay.c $(COMM_HDR) aflnet.o aflnet.h | test_x86
 	$(CC) $(CFLAGS) $@.c aflnet.o -o $@ $(LDFLAGS)
