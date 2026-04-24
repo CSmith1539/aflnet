@@ -9,6 +9,13 @@
 
 #define FASTDYN_SYNC_SHM_NAME "/fastdyn_sync_state"
 
+#define FASTDYN_TRACE_CAP 16384   /* PCs per run (64 KB per buffer) */
+
+typedef struct {
+    uint32_t count;
+    uint32_t entries[FASTDYN_TRACE_CAP];
+} fastdyn_trace_run_t;
+
 typedef struct {
   _Atomic uint64_t tx_seq;
   _Atomic uint64_t ack_seq;
@@ -44,14 +51,6 @@ unsigned int* extract_response_codes_tcp(unsigned char* buf, unsigned int buf_si
 
 // frees the memory saved for a snapshot
 void fastdyn_snap_free();
-
-/*
- * Replay one seed file through the tap_fd IPC on a loop until
- * fuzz_trace_compare() (called inside fuzz_snap_handler) detects a divergence.
- * Enable tracing first via fuzz_trace_enable() (FASTDYN_TRACE_SEED env var
- * path in lwip_ip.c handles this automatically).
- */
-void fastdyn_trace_replay(const char *seed_path);
 
 /* Exported from fuzz_trace.c — used by -Z dry-run trace mode in afl-fuzz.c */
 void fuzz_trace_enable(void);

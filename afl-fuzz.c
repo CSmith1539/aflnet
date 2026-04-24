@@ -80,13 +80,7 @@
 extern void fuzz_trace_enable(void) __attribute__((weak));
 extern void fuzz_trace_reset(void) __attribute__((weak));
 extern bool g_trace_enabled __attribute__((weak));
-#ifndef FASTDYN_TRACE_CAP
-#define FASTDYN_TRACE_CAP 16384
-typedef struct {
-  u32 count;
-  u32 entries[FASTDYN_TRACE_CAP];
-} fastdyn_trace_run_t;
-#endif
+
 extern fastdyn_trace_run_t g_trace_completed __attribute__((weak));
 #else
 extern void fuzz_trace_enable(void);
