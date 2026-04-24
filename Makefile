@@ -27,14 +27,18 @@ MISC_PATH   = $(PREFIX)/share/afl
 PROGS       = afl-gcc afl-fuzz afl-replay aflnet-replay afl-showmap afl-tmin afl-gotcpu afl-analyze
 SH_PROGS    = afl-plot afl-cmin afl-whatsup
 
-CFLAGS     ?= -O3 -funroll-loops
+CFLAGS     ?= -O3 -funroll-loops -fPIC
 CFLAGS     += -Wall -D_FORTIFY_SOURCE=2 -g -Wno-pointer-sign -Wno-unused-result \
 	      -DAFL_PATH=\"$(HELPER_PATH)\" -DDOC_PATH=\"$(DOC_PATH)\" \
 	      -DBIN_PATH=\"$(BIN_PATH)\"
 
 ifneq "$(filter Linux GNU%,$(shell uname))" ""
-  LDFLAGS  += -ldl -lgvc -lcgraph -lm -lcap
+  LDFLAGS  += -ldl -lgvc -lcgraph -lm -lcap -lrt
 endif
+
+# Flags used when compiling afl-fuzz.c as a library object (no main wrapper,
+# externals like CVG and fastdyn_* are provided by the linking program).
+LIB_CFLAGS  = $(CFLAGS) -DAFL_LIB
 
 ifeq "$(findstring clang, $(shell $(CC) --version 2>/dev/null))" ""
   TEST_CC   = afl-gcc
@@ -71,6 +75,15 @@ afl-as: afl-as.c afl-as.h $(COMM_HDR) | test_x86
 
 afl-fuzz: afl-fuzz.c $(COMM_HDR) aflnet.o aflnet.h afl-fastdyn.o afl-fastdyn.h | test_x86
 	$(CC) $(CFLAGS) $@.c aflnet.o afl-fastdyn.o -o $@ $(LDFLAGS)
+
+# Library target: afl-fuzz.c compiled with -DAFL_LIB (no main() wrapper).
+# afl-fastdyn.o is intentionally excluded — CVG and fastdyn_* are provided
+# by the program that links against this archive.
+afl-fuzz-lib.o: afl-fuzz.c $(COMM_HDR) aflnet.h afl-fastdyn.h | test_x86
+	$(CC) $(LIB_CFLAGS) -c afl-fuzz.c -o afl-fuzz-lib.o
+
+libaflnet.a: afl-fuzz-lib.o aflnet.o afl-fastdyn.o
+	$(AR) rcs $@ $^
 
 afl-replay: afl-replay.c $(COMM_HDR) aflnet.o aflnet.h | test_x86
 	$(CC) $(CFLAGS) $@.c aflnet.o -o $@ $(LDFLAGS)

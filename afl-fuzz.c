@@ -28,7 +28,6 @@
 
 */
 
-#define AFL_MAIN
 #include "android-ashmem.h"
 #define MESSAGES_TO_STDOUT
 
@@ -77,6 +76,29 @@
 #  include <sys/sysctl.h>
 #endif /* __APPLE__ || __FreeBSD__ || __OpenBSD__ */
 
+#if defined(__GNUC__)
+extern void fuzz_trace_enable(void) __attribute__((weak));
+extern void fuzz_trace_reset(void) __attribute__((weak));
+extern bool g_trace_enabled __attribute__((weak));
+#ifndef FASTDYN_TRACE_CAP
+#define FASTDYN_TRACE_CAP 16384
+typedef struct {
+  u32 count;
+  u32 entries[FASTDYN_TRACE_CAP];
+} fastdyn_trace_run_t;
+#endif
+extern fastdyn_trace_run_t g_trace_completed __attribute__((weak));
+#else
+extern void fuzz_trace_enable(void);
+extern void fuzz_trace_reset(void);
+extern bool g_trace_enabled;
+typedef struct {
+  u32 count;
+  u32 entries[16384];
+} fastdyn_trace_run_t;
+extern fastdyn_trace_run_t g_trace_completed;
+#endif
+
 /* For systems that have sched_setaffinity; right now just Linux, but one
    can hope... */
 
@@ -119,7 +141,7 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            force_deterministic,       /* Force deterministic stages?      */
            use_splicing,              /* Recombine input files?           */
            dumb_mode,                 /* Run in non-instrumented mode?    */
-           extern_cov,                /* External coverage tracking mode? */
+           extern_usage,              /* External coverage, inputs, etc?  */
            score_changed,             /* Scoring for favorites changed?   */
            kill_signal,               /* Signal that killed the child     */
            resuming_fuzz,             /* Resuming an older fuzzing job?   */
@@ -140,7 +162,8 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            run_over10m,               /* Run time over 10 minutes?        */
            persistent_mode,           /* Running in persistent mode?      */
            deferred_mode,             /* Deferred forkserver mode?        */
-           fast_cal;                  /* Try to calibrate faster?         */
+           fast_cal,                  /* Try to calibrate faster?         */
+           trace_calibration;         /* Trace repeated calibration runs? */
 
 static s32 out_fd,                    /* Persistent fd for out_file       */
            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
@@ -152,7 +175,7 @@ static s32 forksrv_pid,               /* PID of the fork server           */
            child_pid = -1,            /* PID of the fuzzed program        */
            out_dir_fd = -1;           /* FD of the lock file              */
 
-static s32 initial_snapshot = -1;     /* Snapshot handle for extern_cov mode */
+static s32 initial_snapshot = -1;     /* Snapshot handle for extern_usage mode */
 
 EXP_ST u8* trace_bits;                /* SHM with instrumentation bitmap  */
 
@@ -354,6 +377,7 @@ char** use_argv;  /* argument to run the target program. In vanilla AFL, this is
 static u8 run_target(char** argv, u32 timeout);
 static inline u32 UR(u32 limit);
 static inline u8 has_new_bits(u8* virgin_map);
+static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault);
 
 /* AFLNet-specific variables & functions */
 
@@ -388,7 +412,6 @@ u32 state_count = 0; /* Number of states in the state sequence */
 
 /* flags */
 u8 use_net = 0;
-u8 extern_send = 0;          /* External send/recv via fastdyn hooks (-Y) */
 u8 poll_wait = 0;
 u8 server_wait = 0;
 u8 socket_timeout = 0;
@@ -484,6 +507,11 @@ void update_state_bitmap(){
     ck_free(state_sequence);
     state_sequence = NULL;
   }
+
+  if (!extract_response_codes) {
+    FATAL("update_state_bitmap: extract_response_codes is NULL — did you forget -P <protocol>?");
+  }
+
   state_sequence = (*extract_response_codes)(response_buf, response_buf_size, &state_count);
 
   if(feedback_type != STATE_FEEDBACK && feedback_type != CODE_STATE_FEEDBACK) return;
@@ -987,7 +1015,7 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
 
 /* Send mutated messages via fastdyn hooks instead of a real socket.
    Used when -Y is given; no IP/port/protocol needed. */
-static int send_over_fastdyn()
+static int send_over_fastdyn(u32 timeout)
 {
   static uint8_t recv_buf[65536];
   u8 likely_buggy = 0;
@@ -1009,23 +1037,45 @@ static int send_over_fastdyn()
   kliter_t(lms) *it;
   messages_sent = 0;
 
+  // fprintf(stderr, "[fastdyn-dbg] send_over_fastdyn: kl_messages size=%zu\n",
+  //         (size_t)kl_messages->size);
+
   for (it = kl_begin(kl_messages); it != kl_end(kl_messages); it = kl_next(it)) {
-    int n = fastdyn_send(kl_val(it)->mdata, kl_val(it)->msize);
+    int n = fastdyn_send((uint8_t*)kl_val(it)->mdata, kl_val(it)->msize, timeout);
+    // fprintf(stderr, "[fastdyn-dbg] fastdyn_send -> %d\n", n);
     messages_sent++;
 
     response_bytes = (u32 *) ck_realloc(response_bytes, messages_sent * sizeof(u32));
 
-    if (n != (int)kl_val(it)->msize) goto FASTDYN_HANDLE_RESPONSES;
+    if (n == -2) {
+      /* Send timed out: firmware never returned to its input loop — hang. */
+      fprintf(stderr, "[fastdyn-dbg] fastdyn_send timed out, flagging hang\n");
+      child_timed_out = 1;
+      goto FASTDYN_HANDLE_RESPONSES;
+    }
+
+    if (n == -1 || n != (int)kl_val(it)->msize) {
+      // fprintf(stderr, "[fastdyn-dbg] short/failed send, jumping to FASTDYN_HANDLE_RESPONSES\n");
+      goto FASTDYN_HANDLE_RESPONSES;
+    }
 
     u32 prev_buf_size = response_buf_size;
-    int rn = fastdyn_recv(recv_buf, sizeof(recv_buf), poll_wait_msecs);
-    if (rn > 0) {
-      response_buf = (char *) ck_realloc(response_buf, response_buf_size + rn + 1);
-      memcpy(response_buf + response_buf_size, recv_buf, rn);
-      response_buf_size += rn;
-      response_buf[response_buf_size] = '\0';
-    } else if (rn < 0) {
-      goto FASTDYN_HANDLE_RESPONSES;
+    while (1) {
+      int rn = fastdyn_recv(recv_buf, sizeof(recv_buf), 0);
+      // fprintf(stderr, "[fastdyn-dbg] fastdyn_recv -> %d\n", rn);
+      if (rn > 0) {
+        response_buf = (char *) ck_realloc(response_buf, response_buf_size + rn + 1);
+        memcpy(response_buf + response_buf_size, recv_buf, rn);
+        response_buf_size += rn;
+        response_buf[response_buf_size] = '\0';
+        continue;
+      }
+
+      if (rn == -1) goto FASTDYN_HANDLE_RESPONSES;
+
+      /* rn == 0: loop signal consumed, firmware finished this round.
+       * rn == -2: nothing left queued right now; also fine. */
+      break;
     }
 
     response_bytes[messages_sent - 1] = response_buf_size;
@@ -1036,12 +1086,23 @@ static int send_over_fastdyn()
 
 FASTDYN_HANDLE_RESPONSES:
   {
-    int rn = fastdyn_recv(recv_buf, sizeof(recv_buf), poll_wait_msecs);
-    if (rn > 0) {
-      response_buf = (char *) ck_realloc(response_buf, response_buf_size + rn + 1);
-      memcpy(response_buf + response_buf_size, recv_buf, rn);
-      response_buf_size += rn;
-      response_buf[response_buf_size] = '\0';
+    /* Non-blocking drain to match net_recv(): collect every queued response
+     * frame, then consume the pending loop signal once the queue is empty. */
+    while (1) {
+      int rn = fastdyn_recv(recv_buf, sizeof(recv_buf), 0);
+      // fprintf(stderr, "[fastdyn-dbg] (RSP) fastdyn_recv -> %d\n", rn);
+      if (rn > 0) {
+        response_buf = (char *) ck_realloc(response_buf, response_buf_size + rn + 1);
+        memcpy(response_buf + response_buf_size, recv_buf, rn);
+        response_buf_size += rn;
+        response_buf[response_buf_size] = '\0';
+        continue;
+      }
+
+      /* rn == 0: loop signal consumed, nothing to do.
+       * rn == -2: nothing pending, fine — next send's drain handles cleanup.
+       * rn == -1: treat as no more data; the main fault path is already set. */
+      break;
     }
   }
 
@@ -1055,10 +1116,12 @@ FASTDYN_HANDLE_RESPONSES:
 
   if (likely_buggy && false_negative_reduction) return 0;
 
-  if (terminate_child && (child_pid > 0)) kill(child_pid, SIGTERM);
-  while(1 && 0) {
-    int status = kill(child_pid, 0);
-    if ((status != 0) && (errno == ESRCH)) break;
+  if (!extern_usage) {
+    if (terminate_child && (child_pid > 0)) kill(child_pid, SIGTERM);
+    while(1) {
+      int status = kill(child_pid, 0);
+      if ((status != 0) && (errno == ESRCH)) break;
+    }
   }
 
   return 0;
@@ -1205,8 +1268,8 @@ HANDLE_RESPONSES:
 }
 
 /* Dispatch to the appropriate send implementation based on active flags. */
-static void send_inputs(void) {
-  if (extern_send) send_over_fastdyn();
+static void send_inputs(u32 timeout) {
+  if (extern_usage) send_over_fastdyn(timeout);
   else if (use_net) send_over_network();
 }
 /* End of AFLNet-specific variables & functions */
@@ -2285,14 +2348,24 @@ static void cull_queue(void) {
 
 /* Configure shared memory and virgin_bits. This is called at startup. */
 
-EXP_ST void setup_shm(void) {
+/* When extern_usage is set, the caller provides the coverage bitmap directly
+   via this symbol rather than through a SHM region. */
+extern uint8_t CVG[MAP_SIZE];
 
-  u8* shm_str;
+EXP_ST void setup_shm(void) {
 
   if (!in_bitmap) memset(virgin_bits, 255, MAP_SIZE);
 
   memset(virgin_tmout, 255, MAP_SIZE);
   memset(virgin_crash, 255, MAP_SIZE);
+
+  if (extern_usage) {
+    /* Use the caller's coverage map directly; no SHM needed. */
+    trace_bits = CVG;
+    return;
+  }
+
+  u8* shm_str;
 
   shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
 
@@ -3235,7 +3308,7 @@ EXP_ST void init_forkserver(char** argv) {
    information. The called program will update trace_bits[]. */
 
 static u8 run_target(char** argv, u32 timeout) {
-
+  
   static struct itimerval it;
   static u32 prev_timed_out = 0;
   static u64 exec_ms = 0;
@@ -3252,26 +3325,22 @@ static u8 run_target(char** argv, u32 timeout) {
   memset(trace_bits, 0, MAP_SIZE);
   MEM_BARRIER();
 
-  /* In extern_cov mode the target process is managed externally. We use
+  /* In extern_usage mode the target process is managed externally. We use
      the fastdyn snapshot API to reset its state instead of fork/exec. */
 
 // TODO: work this in to the following if/else better
-  if (extern_cov) {
-
-    if (initial_snapshot == -1) {
-      initial_snapshot = fastdyn_snap();
-      if (initial_snapshot < 0) FATAL("fastdyn_snap() failed");
-    } else {
-      if (fastdyn_snap_restore(initial_snapshot) < 0)
-        FATAL("fastdyn_snap_restore() failed");
-    }
+  if (extern_usage) {
+    // AFLNet typically expects to fork before sending inputs, but due to the nature of our rehosting, we restore our snapshot after each run, rather than before
+    // restoring before will cause some timing issues, exact issue unknown but not important since current setup is tested and works properly
 
     /* Configure timeout before sending, same as normal path. */
     it.it_value.tv_sec  = (timeout / 1000);
     it.it_value.tv_usec = (timeout % 1000) * 1000;
     setitimer(ITIMER_REAL, &it, NULL);
 
-    send_inputs();
+    send_inputs(timeout);
+
+    int snap_ret = fastdyn_snap_restore();
 
     /* No process exit status to collect; fold into normal FAULT_NONE path.
        Timeout is still detectable via child_timed_out (set by SIGALRM). */
@@ -3284,8 +3353,7 @@ static u8 run_target(char** argv, u32 timeout) {
     it.it_value.tv_usec = 0;
     setitimer(ITIMER_REAL, &it, NULL);
 
-    goto extern_cov_wait_done;
-
+    goto extern_usage_wait_done;
   }
 
   /* If we're running in "dumb" mode, we can't rely on the fork server
@@ -3410,11 +3478,11 @@ static u8 run_target(char** argv, u32 timeout) {
   /* The SIGALRM handler simply kills the child_pid and sets child_timed_out. */
 
   if (dumb_mode == 1 || no_forkserver) {
-    send_inputs();
+    send_inputs(timeout);
     if (waitpid(child_pid, &status, 0) <= 0) PFATAL("waitpid() failed");
 
   } else {
-    send_inputs();
+    send_inputs(timeout);
     s32 res;
 
     if ((res = read(fsrv_st_fd, &status, 4)) != 4) {
@@ -3437,7 +3505,7 @@ static u8 run_target(char** argv, u32 timeout) {
 
   setitimer(ITIMER_REAL, &it, NULL);
 
-extern_cov_wait_done:
+extern_usage_wait_done:
 
   total_execs++;
 
@@ -3459,6 +3527,11 @@ extern_cov_wait_done:
   prev_timed_out = child_timed_out;
 
   /* Report outcome to caller. */
+
+  /* In extern_usage mode there is no child process, so WIFSIGNALED is never
+     true.  Detect hangs via child_timed_out set either by SIGALRM or by
+     send_over_fastdyn when fastdyn_send's poll times out. */
+  if (extern_usage && child_timed_out && !stop_soon) return FAULT_TMOUT;
 
   if (WIFSIGNALED(status) && !stop_soon) {
 
@@ -3490,7 +3563,6 @@ extern_cov_wait_done:
   }
 
   return FAULT_NONE;
-
 }
 
 
@@ -3505,6 +3577,59 @@ static void write_to_testcase(void* mem, u32 len) {
 }
 
 static void show_stats(void);
+
+static void start_calibration_trace(void) {
+
+  if (!trace_calibration) return;
+
+  if (!fuzz_trace_enable || !fuzz_trace_reset || !&g_trace_enabled)
+    FATAL("-Z requires FastDyn trace hooks");
+
+  fuzz_trace_reset();
+  fuzz_trace_enable();
+
+}
+
+static void stop_calibration_trace(void) {
+
+  if (!trace_calibration || !&g_trace_enabled) return;
+  g_trace_enabled = 0;
+
+}
+
+static u8 sync_testcase(char** argv, u8* path, u8* mem, u32 len,
+                        region_t* regions, u32 region_count, u8* source_name,
+                        u32 source_case) {
+
+  u8 fault, imported = 0;
+
+  write_to_testcase(mem, len);
+
+  kl_messages = construct_kl_messages(path, regions, region_count);
+
+  fault = run_target(argv, exec_tmout);
+
+  if (!stop_soon) {
+
+    /* Enable request extraction while queueing imported inputs. */
+    corpus_read_or_sync = 2;
+
+    syncing_party = source_name;
+    syncing_case = source_case;
+    imported = save_if_interesting(argv, mem, len, fault);
+    syncing_party = 0;
+
+    /* Disable request extraction outside import handling. */
+    corpus_read_or_sync = 0;
+
+  }
+
+  ck_free(regions);
+  delete_kl_messages(kl_messages);
+
+  return imported;
+
+}
 
 /* Calibrate a new test case. This is done when processing the input directory
    to warn about flaky or otherwise problematic test cases early on; and when
@@ -3540,11 +3665,12 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   /* Make sure the forkserver is up before we do anything, and let's not
      count its spin-up time toward binary calibration. */
 
-  if (dumb_mode != 1 && !no_forkserver && !extern_cov && !forksrv_pid)
+  if (dumb_mode != 1 && !no_forkserver && !extern_usage && !forksrv_pid)
     init_forkserver(argv);
 
   if (q->exec_cksum) memcpy(first_trace, trace_bits, MAP_SIZE);
 
+  start_calibration_trace();
   start_us = get_cur_time_us();
 
   for (stage_cur = 0; stage_cur < stage_max; stage_cur++) {
@@ -3562,7 +3688,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
     if (stop_soon || fault != crash_mode) goto abort_calibration;
 
-    if (!dumb_mode && !extern_cov && !stage_cur && !count_bytes(trace_bits)) {
+    if (!dumb_mode && !extern_usage && !stage_cur && !count_bytes(trace_bits)) {
       fault = FAULT_NOINST;
       goto abort_calibration;
     }
@@ -3627,6 +3753,8 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
   if (!dumb_mode && first_run && !fault && !new_bits) fault = FAULT_NOBITS;
 
 abort_calibration:
+
+  stop_calibration_trace();
 
   if (new_bits == 2 && !q->has_new_cov) {
     q->has_new_cov = 1;
@@ -4013,7 +4141,6 @@ static void pivot_inputs(void) {
   }
 
   if (in_place_resume) nuke_resume_dir();
-
 }
 
 
@@ -4747,7 +4874,6 @@ static void maybe_delete_out_dir(void) {
     fn = alloc_printf("%s/.synced", out_dir);
     if (delete_files(fn, NULL)) goto dir_cleanup_failed;
     ck_free(fn);
-
   }
 
   /* Next, we need to clean up <out_dir>/queue/.state/ subdirectories: */
@@ -7768,8 +7894,6 @@ abandon_entry:
 }
 
 
-/* Grab interesting test cases from other fuzzers. */
-
 static void sync_fuzzers(char** argv) {
 
   DIR* sd;
@@ -7863,38 +7987,16 @@ static void sync_fuzzers(char** argv) {
 
       if (st.st_size && st.st_size <= MAX_FILE) {
 
-        u8  fault;
+        u32 region_count;
         u8* mem = mmap(0, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
 
         if (mem == MAP_FAILED) PFATAL("Unable to mmap '%s'", path);
 
-        /* See what happens. We rely on save_if_interesting() to catch major
-           errors and save the test case. */
-
-        write_to_testcase(mem, st.st_size);
-
-        region_t *regions;
-        u32 region_count;
-        regions = (*extract_requests)(mem, st.st_size, &region_count);
-        kl_messages = construct_kl_messages(path, regions, region_count);
-
-        fault = run_target(argv, exec_tmout);
-
-        if (stop_soon) return;
-
-        /* AFLNet: set this flag to enable request extractions while adding new seed to the queue */
-        corpus_read_or_sync = 2;
-
-        syncing_party = sd_ent->d_name;
-        queued_imported += save_if_interesting(argv, mem, st.st_size, fault);
-        syncing_party = 0;
-
-        /* AFLNet delete the kl_messages */
-        ck_free(regions);
-        delete_kl_messages(kl_messages);
-
-        /* AFLNet: unset this flag to disable request extractions while adding new seed to the queue */
-        corpus_read_or_sync = 0;
+        queued_imported += sync_testcase(argv, path, mem, st.st_size,
+                                         (*extract_requests)(mem, st.st_size,
+                                                             &region_count),
+                                         region_count, sd_ent->d_name,
+                                         syncing_case);
 
         munmap(mem, st.st_size);
 
@@ -7920,6 +8022,17 @@ static void sync_fuzzers(char** argv) {
 
 }
 
+static void maybe_sync_external_inputs(char** argv, u8 skipped_fuzz,
+                                       u32* sync_interval_cnt) {
+
+  if (stop_soon || skipped_fuzz) return;
+
+  if ((*sync_interval_cnt)++ % SYNC_INTERVAL) return;
+
+  if (sync_id) sync_fuzzers(argv);
+
+}
+
 
 /* Handle stop signal (Ctrl-C, etc). */
 
@@ -7927,9 +8040,42 @@ static void handle_stop_sig(int sig) {
 
   stop_soon = 1;
 
-  if (child_pid > 0) kill(child_pid, SIGKILL);
-  if (forksrv_pid > 0) kill(forksrv_pid, SIGKILL);
+  if (!extern_usage) {
+    if (child_pid > 0) kill(child_pid, SIGKILL);
+    if (forksrv_pid > 0) kill(forksrv_pid, SIGKILL);
+  }
+}
 
+
+/* Handle a fatal signal (SIGSEGV/SIGABRT/SIGBUS/SIGFPE) that kills the host
+ * process.  Because aflnet runs as a library inside QEMU, a firmware-triggered
+ * crash kills us too.  Save the current kl_messages as a crash input before
+ * re-raising so core-dump / default behaviour still happens.
+ *
+ * This intentionally calls non-async-signal-safe functions (malloc, open,
+ * write via save_kl_messages_to_file) — acceptable because we are already
+ * crashing and this is a best-effort save. */
+
+static void handle_host_crash(int sig) {
+  /* Restore default so a second fault doesn't re-enter us. */
+  signal(sig, SIG_DFL);
+
+  if (out_dir && kl_messages) {
+    /* Ensure the crashes directory exists (may not exist if we crash early). */
+    u8 *crash_dir = alloc_printf("%s/replayable-crashes", out_dir);
+    mkdir((char *)crash_dir, 0700);
+
+    u8 *fn = alloc_printf("%s/replayable-crashes/id:%06llu,sig:%02u,host_crash",
+                          out_dir, unique_crashes, (unsigned)sig);
+
+    save_kl_messages_to_file(kl_messages, fn, 1, messages_sent);
+    unique_crashes++;
+
+    free(crash_dir);
+    free(fn);
+  }
+
+  raise(sig);
 }
 
 
@@ -7945,7 +8091,7 @@ static void handle_skipreq(int sig) {
 
 static void handle_timeout(int sig) {
 
-  if (extern_cov) {
+  if (extern_usage) {
     /* Process is externally managed; just flag the timeout and let
        the network I/O layer (poll/send timeouts) unblock naturally. */
     child_timed_out = 1;
@@ -8070,7 +8216,7 @@ EXP_ST void check_binary(u8* fname) {
 
 #endif /* ^!__APPLE__ */
 
-  if (!qemu_mode && !dumb_mode && !extern_cov &&
+  if (!qemu_mode && !dumb_mode && !extern_usage &&
       !memmem(f_data, f_len, SHM_ENV_VAR, strlen(SHM_ENV_VAR) + 1)) {
 
     SAYF("\n" cLRD "[-] " cRST
@@ -8248,13 +8394,14 @@ static void usage(u8* argv0) {
        "  -q algo       - state selection algorithm (See aflnet.h for all available options)\n"
        "  -s algo       - seed selection algorithm (See aflnet.h for all available options)\n"
        "  -b algo       - feedback type (See aflnet.h for all available options)\n"
-       "  -h algo       - seed schedule type (See aflnet.h for all available options)\n\n"
+       "  -h algo       - seed schedule type (See aflnet.h for all available options)\n"
 
        "Other stuff:\n\n"
 
        "  -T text       - text banner to show on the screen\n"
        "  -M / -S id    - distributed mode (see parallel_fuzzing.txt)\n"
-       "  -C            - crash exploration mode (the peruvian rabbit thing)\n\n"
+       "  -C            - crash exploration mode (the peruvian rabbit thing)\n"
+       "  -Z            - compare FastDyn traces across repeated calibration runs\n\n"
 
        "For additional tips, please consult %s/README.\n\n",
 
@@ -8722,7 +8869,6 @@ EXP_ST void detect_file_args(char** argv) {
   if (!cwd) PFATAL("getcwd() failed");
 
   while (argv[i]) {
-
     u8* aa_loc = strstr(argv[i], "@@");
 
     if (aa_loc) {
@@ -8730,7 +8876,6 @@ EXP_ST void detect_file_args(char** argv) {
       u8 *aa_subst, *n_arg;
 
       /* If we don't have a file name chosen yet, use a safe default. */
-
       if (!out_file)
         out_file = alloc_printf("%s/.cur_input", out_dir);
 
@@ -8747,7 +8892,6 @@ EXP_ST void detect_file_args(char** argv) {
       *aa_loc = '@';
 
       if (out_file[0] != '/') ck_free(aa_subst);
-
     }
 
     i++;
@@ -8755,7 +8899,6 @@ EXP_ST void detect_file_args(char** argv) {
   }
 
   free(cwd); /* not tracked */
-
 }
 
 
@@ -8794,6 +8937,14 @@ EXP_ST void setup_signal_handlers(void) {
 
   sa.sa_handler = handle_skipreq;
   sigaction(SIGUSR1, &sa, NULL);
+
+  /* Fatal signals from the host process (firmware crash kills QEMU+aflnet). */
+
+  sa.sa_handler = handle_host_crash;
+  sigaction(SIGSEGV, &sa, NULL);
+  sigaction(SIGABRT, &sa, NULL);
+  sigaction(SIGBUS,  &sa, NULL);
+  sigaction(SIGFPE,  &sa, NULL);
 
   /* Things we don't care about. */
 
@@ -8949,11 +9100,9 @@ static int check_ep_capability(cap_value_t cap, const char *filename) {
   return 0;
 }
 
-#ifndef AFL_LIB
+/* Main entry point — callable as a library via afl_main() */
 
-/* Main entry point */
-
-int main(int argc, char** argv) {
+void *afl_main(void* arg) {
 
   s32 opt;
   u64 prev_queued = 0;
@@ -8973,7 +9122,13 @@ int main(int argc, char** argv) {
   gettimeofday(&tv, &tz);
   srandom(tv.tv_sec ^ tv.tv_usec ^ getpid());
 
-  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:b:h:XY")) > 0)
+  char **argv = (char**)arg;
+  int argc = 0;
+  while (argv[argc] != NULL) {
+    argc++;
+  }
+
+  while ((opt = getopt(argc, argv, "+i:o:f:m:t:T:dnCB:S:M:x:QN:D:W:w:e:P:KEq:s:RFc:l:b:h:g:XYZ")) > 0)
 
     switch (opt) {
 
@@ -9128,14 +9283,14 @@ int main(int argc, char** argv) {
 
       case 'X': /* external coverage tracking */
 
-        if (extern_cov) FATAL("Multiple -X options not supported");
-        extern_cov = 1;
+        if (extern_usage) FATAL("Multiple -X options not supported");
+        extern_usage = 1;
         break;
 
-      case 'Y': /* external send/recv via fastdyn hooks */
+      case 'Z': /* trace repeated calibration runs */
 
-        if (extern_send) FATAL("Multiple -Y options not supported");
-        extern_send = 1;
+        if (trace_calibration) FATAL("Multiple -Z options not supported");
+        trace_calibration = 1;
         break;
 
       case 'T': /* banner */
@@ -9168,7 +9323,7 @@ int main(int argc, char** argv) {
         break;
 
       case 'W': /* polling timeout determining maximum amount of time waited before concluding that no responses are forthcoming*/
-        if (socket_timeout) FATAL("Multiple -W options not supported");
+        if (poll_wait) FATAL("Multiple -W options not supported");
 
         if (sscanf(optarg, "%u", &poll_wait_msecs) < 1 || optarg[0] == '-') FATAL("Bad syntax used for -W");
         poll_wait = 1;
@@ -9241,6 +9396,12 @@ int main(int argc, char** argv) {
         }else if (!strcmp(optarg, "SNMP")) {
           extract_requests = &extract_requests_SNMP;
           extract_response_codes = &extract_response_codes_SNMP;
+        } else if (!strcmp(optarg, "TCP")) {
+          extract_requests = &extract_requests_tcp;
+          extract_response_codes = &extract_response_codes_tcp;
+        } else if (!strcmp(optarg, "ETHERNET")) {
+          extract_requests = &extract_requests_ethernet;
+          extract_response_codes = &extract_response_codes_ethernet;
         } else {
           FATAL("%s protocol is not supported yet!", optarg);
         }
@@ -9306,12 +9467,12 @@ int main(int argc, char** argv) {
 
     }
 
-  if ((!extern_cov && optind == argc) || !in_dir || !out_dir) {
+  if ((!extern_usage && optind == argc) || !in_dir || !out_dir) {
     usage(argv[0]);
   }
 
   //AFLNet - Check for required arguments
-  if (!use_net && !extern_send) FATAL("Please specify network information of the server under test (e.g., tcp://127.0.0.1/8554)");
+  if (!use_net && !extern_usage) FATAL("Please specify network information of the server under test (e.g., tcp://127.0.0.1/8554)");
 
   if (!protocol_selected) FATAL("Please specify the protocol to be tested using the -P option");
 
@@ -9367,9 +9528,17 @@ int main(int argc, char** argv) {
 
   save_cmdline(argc, argv);
 
-  fix_up_banner(extern_cov ? (u8*)"(external)" : argv[optind]);
+  fix_up_banner(extern_usage ? (u8*)"(external)" : argv[optind]);
 
   check_if_tty();
+
+#ifdef AFL_LIB
+  /* When embedded as a library the parent program owns the terminal.
+   * Force not_on_tty so show_stats() returns immediately and never
+   * emits TERM_HOME / CURSOR_HIDE / TERM_CLEAR escape sequences that
+   * would corrupt the caller's output. */
+  not_on_tty = 1;
+#endif /* AFL_LIB */
 
   get_core_count();
 
@@ -9398,11 +9567,13 @@ int main(int argc, char** argv) {
 
   if (!timeout_given) find_timeout();
 
-  detect_file_args(argv + optind + 1);
+  int dcount = 0;
+
+  if (!extern_usage) detect_file_args(argv + optind + 1);
 
   if (!out_file) setup_stdio_file();
 
-  if (!extern_cov) check_binary(argv[optind]);
+  if (!extern_usage) check_binary(argv[optind]);
 
   start_time = get_cur_time();
 
@@ -9533,12 +9704,7 @@ int main(int argc, char** argv) {
 
       skipped_fuzz = fuzz_one(use_argv);
 
-      if (!stop_soon && sync_id && !skipped_fuzz) {
-
-        if (!(sync_interval_cnt++ % SYNC_INTERVAL))
-          sync_fuzzers(use_argv);
-
-      }
+      maybe_sync_external_inputs(use_argv, skipped_fuzz, &sync_interval_cnt);
 
       if (!stop_soon && exit_1) stop_soon = 2;
 
@@ -9597,12 +9763,7 @@ int main(int argc, char** argv) {
 
       skipped_fuzz = fuzz_one(use_argv);
 
-      if (!stop_soon && sync_id && !skipped_fuzz) {
-
-        if (!(sync_interval_cnt++ % SYNC_INTERVAL))
-          sync_fuzzers(use_argv);
-
-      }
+      maybe_sync_external_inputs(use_argv, skipped_fuzz, &sync_interval_cnt);
 
       if (!stop_soon && exit_1) stop_soon = 2;
 
@@ -9653,12 +9814,7 @@ int main(int argc, char** argv) {
 
       skipped_fuzz = fuzz_one(use_argv);
 
-      if (!stop_soon && sync_id && !skipped_fuzz) {
-
-        if (!(sync_interval_cnt++ % SYNC_INTERVAL))
-          sync_fuzzers(use_argv);
-
-      }
+      maybe_sync_external_inputs(use_argv, skipped_fuzz, &sync_interval_cnt);
 
       if (!stop_soon && exit_1) stop_soon = 2;
 
@@ -9707,7 +9863,7 @@ stop_fuzzing:
   destroy_extras();
   ck_free(target_path);
 
-  if (extern_cov && initial_snapshot >= 0) fastdyn_snap_free(initial_snapshot);
+  //if (extern_usage && initial_snapshot >= 0) fastdyn_snap_free(initial_snapshot);
   ck_free(sync_id);
 
   destroy_ipsm();
@@ -9721,4 +9877,7 @@ stop_fuzzing:
 
 }
 
+/* When built as a standalone binary, delegate to afl_main(). */
+#ifndef AFL_LIB
+int main(int argc, char** argv) { return (int)afl_main((void*)argv); }
 #endif /* !AFL_LIB */

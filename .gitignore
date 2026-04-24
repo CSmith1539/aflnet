@@ -10,6 +10,9 @@ afl-gotcpu
 afl-replay
 afl-showmap
 afl-tmin
+afl-fastdyn.o
+afl-fuzz-lib.o
+libaflnet.a
 aflnet-replay
 aflnet.o
 as

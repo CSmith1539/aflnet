@@ -2407,6 +2407,166 @@ unsigned int* extract_response_codes_ipp(unsigned char* buf, unsigned int buf_si
   return state_sequence;
 }
 
+// ============================================================
+// Ethernet-level protocol handlers (IPv4/TCP + ARP)
+// ============================================================
+//
+// ARP state raw IDs passed to get_mapped_message_code:
+//   ARP request : 0x01000001
+//   ARP reply   : 0x01000002
+//
+// TCP flag bytes are 0x00-0xFF, so the ARP IDs above (> 0xFFFF)
+// are guaranteed never to collide with TCP flag state values.
+
+#define ETH_HEADER_LEN     14
+#define ARP_FRAME_LEN      42    /* Ethernet(14) + ARP-over-IPv4(28) */
+#define ETHERTYPE_IPV4   0x0800
+#define ETHERTYPE_ARP    0x0806
+#define IPPROTO_TCP_VAL  0x06
+#define ARP_STATE_REQUEST  0x01000001u
+#define ARP_STATE_REPLY    0x01000002u
+
+/* Return the byte length of the Ethernet frame at buf[offset].
+ * Uses the IPv4 total-length field for IPv4 frames and a fixed
+ * 42-byte size for ARP-over-Ethernet.  Returns 0 on a malformed
+ * or truncated frame so the caller can stop iterating. */
+static unsigned int eth_frame_len(const unsigned char *buf,
+                                   unsigned int offset,
+                                   unsigned int buf_size)
+{
+    if (offset + ETH_HEADER_LEN > buf_size) return 0;
+
+    uint16_t ethertype = ((uint16_t)buf[offset + 12] << 8) |
+                          (uint16_t)buf[offset + 13];
+
+    //printf("[eth] - ethertype = %x\n", ethertype);
+
+    if (ethertype == ETHERTYPE_IPV4) {
+        if (offset + ETH_HEADER_LEN + 4 > buf_size) return 0;
+        uint16_t ip_total = ((uint16_t)buf[offset + ETH_HEADER_LEN + 2] << 8) |
+                             (uint16_t)buf[offset + ETH_HEADER_LEN + 3];
+        unsigned int total = (unsigned int)ETH_HEADER_LEN + ip_total;
+        if (offset + total > buf_size) return 0;
+        return total;
+    } else if (ethertype == ETHERTYPE_ARP) {
+        if (offset + ARP_FRAME_LEN > buf_size) return 0;
+        return ARP_FRAME_LEN;
+    }
+    return 0;
+}
+
+/* Split a buffer of concatenated raw Ethernet frames into one region per
+ * frame, using the IPv4 total-length or the fixed ARP frame size to find
+ * boundaries.  Falls back to a single whole-buffer region on parse failure. */
+region_t* extract_requests_ethernet(unsigned char *buf,
+                                     unsigned int buf_size,
+                                     unsigned int *region_count_ref)
+{
+    unsigned int region_count = 0;
+    region_t *regions = NULL;
+    unsigned int offset = 0;
+
+    while (offset < buf_size) {
+        unsigned int flen = eth_frame_len(buf, offset, buf_size);
+        //printf("[eth] - flen = %u\n", flen);
+        if (flen == 0) break;
+
+        region_count++;
+        regions = (region_t *)ck_realloc(regions,
+                                          region_count * sizeof(region_t));
+        regions[region_count - 1].start_byte    = offset;
+        regions[region_count - 1].end_byte      = offset + flen - 1;
+        regions[region_count - 1].state_sequence = NULL;
+        regions[region_count - 1].state_count    = 0;
+
+        offset += flen;
+    }
+
+    if (region_count == 0 && buf_size > 0) {
+        regions = (region_t *)ck_realloc(regions, sizeof(region_t));
+        regions[0].start_byte    = 0;
+        regions[0].end_byte      = buf_size - 1;
+        regions[0].state_sequence = NULL;
+        regions[0].state_count    = 0;
+        region_count = 1;
+    }
+
+    *region_count_ref = region_count;
+    return regions;
+}
+
+/* Extract state events from a buffer of response Ethernet frames:
+ *   - IPv4/TCP frame  → TCP flags byte (raw 0x00-0xFF)
+ *   - ARP request     → raw value ARP_STATE_REQUEST (0x01000001)
+ *   - ARP reply       → raw value ARP_STATE_REPLY   (0x01000002)
+ * All raw values are normalised through get_mapped_message_code so the
+ * state integers in the returned sequence are compact and non-overlapping. */
+unsigned int* extract_response_codes_ethernet(unsigned char *buf,
+                                               unsigned int buf_size,
+                                               unsigned int *state_count_ref)
+{
+    unsigned int *state_sequence = NULL;
+    unsigned int state_count = 0;
+    unsigned int offset = 0;
+
+    /* Initial state */
+    state_count++;
+    state_sequence = (unsigned int *)ck_realloc(state_sequence,
+                                                  state_count * sizeof(unsigned int));
+    state_sequence[state_count - 1] = 0;
+
+    while (offset < buf_size) {
+        unsigned int flen = eth_frame_len(buf, offset, buf_size);
+        if (flen == 0) break;
+
+        uint16_t ethertype = ((uint16_t)buf[offset + 12] << 8) |
+                              (uint16_t)buf[offset + 13];
+
+        unsigned int raw_code = 0;
+        int emit = 0;
+
+        if (ethertype == ETHERTYPE_IPV4) {
+            uint8_t ihl      = buf[offset + ETH_HEADER_LEN] & 0x0F;
+            uint8_t ip_proto = buf[offset + ETH_HEADER_LEN + 9];
+
+            if (ip_proto == IPPROTO_TCP_VAL) {
+                unsigned int tcp_start = offset + ETH_HEADER_LEN + ihl * 4;
+                /* TCP flags are at byte 13 of the TCP header */
+                if (tcp_start + 14 <= buf_size) {
+                    raw_code = (unsigned int)buf[tcp_start + 13];
+                    emit = 1;
+                }
+            }
+            /* Non-TCP IPv4 frames do not contribute a state event */
+
+        } else if (ethertype == ETHERTYPE_ARP) {
+            /* ARP opcode is at bytes 6-7 of the ARP payload = frame bytes 20-21 */
+            uint16_t opcode = ((uint16_t)buf[offset + 20] << 8) |
+                               (uint16_t)buf[offset + 21];
+            if (opcode == 1) {
+                raw_code = ARP_STATE_REQUEST;
+                emit = 1;
+            } else if (opcode == 2) {
+                raw_code = ARP_STATE_REPLY;
+                emit = 1;
+            }
+        }
+
+        if (emit) {
+            unsigned int mapped = get_mapped_message_code(raw_code);
+            state_count++;
+            state_sequence = (unsigned int *)ck_realloc(state_sequence,
+                                                          state_count * sizeof(unsigned int));
+            state_sequence[state_count - 1] = mapped;
+        }
+
+        offset += flen;
+    }
+
+    *state_count_ref = state_count;
+    return state_sequence;
+}
+
 // kl_messages manipulating functions
 
 klist_t(lms) *construct_kl_messages(u8* fname, region_t *regions, u32 region_count)
