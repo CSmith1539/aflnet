@@ -157,6 +157,7 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            persistent_mode,           /* Running in persistent mode?      */
            deferred_mode,             /* Deferred forkserver mode?        */
            fast_cal,                  /* Try to calibrate faster?         */
+           trace_interesting,         /* Log interesting trace?           */
            trace_calibration;         /* Trace repeated calibration runs? */
 
 static s32 out_fd,                    /* Persistent fd for out_file       */
@@ -1008,7 +1009,7 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
 }
 
 /* Send mutated messages via fastdyn hooks instead of a real socket.
-   Used when -Y is given; no IP/port/protocol needed. */
+   Used when -X is given; no IP/port/protocol needed. */
 static int send_over_fastdyn(u32 timeout)
 {
   static uint8_t recv_buf[65536];
@@ -1041,11 +1042,12 @@ static int send_over_fastdyn(u32 timeout)
 
     response_bytes = (u32 *) ck_realloc(response_bytes, messages_sent * sizeof(u32));
 
-    if (n == -2) {
+    if (child_timed_out || n == -2) {
       /* Send timed out: firmware never returned to its input loop — hang. */
-      fprintf(stderr, "[fastdyn-dbg] fastdyn_send timed out, flagging hang\n");
+      if (!child_timed_out)
+        fprintf(stderr, "[fastdyn-dbg] fastdyn_send timed out, flagging hang\n");
       child_timed_out = 1;
-      goto FASTDYN_HANDLE_RESPONSES;
+      goto FASTDYN_DONE;
     }
 
     if (n == -1 || n != (int)kl_val(it)->msize) {
@@ -1055,6 +1057,8 @@ static int send_over_fastdyn(u32 timeout)
 
     u32 prev_buf_size = response_buf_size;
     while (1) {
+      if (child_timed_out) goto FASTDYN_DONE;
+
       int rn = fastdyn_recv(recv_buf, sizeof(recv_buf), 0);
       // fprintf(stderr, "[fastdyn-dbg] fastdyn_recv -> %d\n", rn);
       if (rn > 0) {
@@ -1082,7 +1086,7 @@ FASTDYN_HANDLE_RESPONSES:
   {
     /* Non-blocking drain to match net_recv(): collect every queued response
      * frame, then consume the pending loop signal once the queue is empty. */
-    while (1) {
+    while (!child_timed_out) {
       int rn = fastdyn_recv(recv_buf, sizeof(recv_buf), 0);
       // fprintf(stderr, "[fastdyn-dbg] (RSP) fastdyn_recv -> %d\n", rn);
       if (rn > 0) {
@@ -1100,9 +1104,9 @@ FASTDYN_HANDLE_RESPONSES:
     }
   }
 
+FASTDYN_DONE:
   if (messages_sent > 0 && response_bytes != NULL)
     response_bytes[messages_sent - 1] = response_buf_size;
-
   memset(session_virgin_bits, 255, MAP_SIZE);
   while(1 && 0) {
     if (has_new_bits(session_virgin_bits) != 2) break;
@@ -2344,7 +2348,7 @@ static void cull_queue(void) {
 
 /* When extern_usage is set, the caller provides the coverage bitmap directly
    via this symbol rather than through a SHM region. */
-extern uint8_t CVG[MAP_SIZE];
+uint8_t CVG[MAP_SIZE];
 
 EXP_ST void setup_shm(void) {
 
@@ -3311,7 +3315,6 @@ static u8 run_target(char** argv, u32 timeout) {
   u32 tb4;
 
   child_timed_out = 0;
-
   /* After this memset, trace_bits[] are effectively volatile, so we
      must prevent any earlier operations from venturing into that
      territory. */
@@ -3334,7 +3337,10 @@ static u8 run_target(char** argv, u32 timeout) {
 
     send_inputs(timeout);
 
-    int snap_ret = fastdyn_snap_restore();
+    if (!child_timed_out) {
+      int snap_ret = fastdyn_snap_restore();
+      (void)snap_ret;
+    }
 
     /* No process exit status to collect; fold into normal FAULT_NONE path.
        Timeout is still detectable via child_timed_out (set by SIGALRM). */
@@ -3555,7 +3561,7 @@ extern_usage_wait_done:
   if (!(timeout > exec_tmout) && (slowest_exec_ms < exec_ms)) {
     slowest_exec_ms = exec_ms;
   }
-
+  
   return FAULT_NONE;
 }
 
@@ -3581,7 +3587,6 @@ static void start_calibration_trace(void) {
 
   fuzz_trace_reset();
   fuzz_trace_enable();
-
 }
 
 static void stop_calibration_trace(void) {
@@ -4229,6 +4234,74 @@ static void write_crash_readme(void) {
 }
 
 
+static void trace_interesting_write_trace(u8* trace_fn, const char* desc,
+                                      u8 fault) {
+
+  FILE* fp = fopen((char*)trace_fn, "w");
+
+  if (!fp) PFATAL("Unable to create '%s'", trace_fn);
+
+  fprintf(fp, "# %s trace capture\n", "interesting input");
+  fprintf(fp, "# desc=%s\n", desc);
+  fprintf(fp, "# fault=%u\n", fault);
+
+  if (!&g_trace_completed || !g_trace_completed.count) {
+    fprintf(fp, "# empty trace\n");
+  } else {
+    u32 i;
+    for (i = 0; i < g_trace_completed.count; i++)
+      fprintf(fp, "0x%08x\n", g_trace_completed.entries[i]);
+  }
+
+  fclose(fp);
+
+}
+
+static void trace_interesting_capture_trace(char** argv, const char* desc) {
+
+  s32 old_sc = stage_cur, old_sm = stage_max;
+  u8* old_sn = stage_name;
+  u8 fault;
+  u64 trace_id;
+  u8 *base_fn, *trace_fn, *seed_fn;
+
+  trace_id = queued_paths;
+
+  #ifndef SIMPLE_FILES
+    base_fn = alloc_printf("%s/interesting-traces/id:%06u,%s", out_dir,
+                          trace_id, desc);
+  #else
+    base_fn = alloc_printf("%s/interesting-traces/id_%06u", out_dir,
+                          trace_id);
+  #endif /* ^!SIMPLE_FILES */
+
+  trace_fn = alloc_printf("%s.trace", base_fn);
+
+  stage_name = "interesting trace";
+  stage_cur  = 0;
+  stage_max  = 1;
+
+  fuzz_trace_reset();
+  fuzz_trace_enable();
+
+  fault = run_target(argv, exec_tmout);
+
+  if (&g_trace_enabled) g_trace_enabled = 0;
+
+  // uses existing kl_messages, doesn't delete
+  trace_interesting_write_trace(trace_fn, desc, fault);
+
+  ck_free(seed_fn);
+  ck_free(trace_fn);
+  ck_free(base_fn);
+
+  stage_name = old_sn;
+  stage_cur  = old_sc;
+  stage_max  = old_sm;
+
+}
+
+
 /* Check if the result of an execve() during routine fuzzing is interesting,
    save or queue the input test case for further analysis if so. Returns 1 if
    entry is saved, 0 otherwise. */
@@ -4263,6 +4336,9 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
 
     u32 full_len = save_kl_messages_to_file(kl_messages, fn, 0, messages_sent);
 
+    /* Re-run new interesting input to capture trace, before add_to_queue increments queued_paths*/
+    if (trace_interesting) trace_interesting_capture_trace(argv, describe_op(hnb));
+
     /* We use the actual length of all messages (full_len), not the len of the mutated message subsequence (len)*/
     add_to_queue(fn, full_len, 0);
 
@@ -4294,7 +4370,6 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     close(fd);*/
 
     keeping = 1;
-
   }
 
   switch (fault) {
@@ -4328,7 +4403,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
          the target with a more generous timeout (unless the default timeout
          is already generous). */
 
-      if (exec_tmout < hang_tmout) {
+      if (!extern_usage && exec_tmout < hang_tmout) {
 
         u8 new_fault;
         write_to_testcase(mem, len);
@@ -4981,6 +5056,12 @@ static void maybe_delete_out_dir(void) {
   /* Delete replayable-queue. */
 
   fn = alloc_printf("%s/replayable-queue", out_dir);
+  if (delete_files(fn, "")) goto dir_cleanup_failed;
+  ck_free(fn);
+
+  /* Delete any old interesting trace captures. */
+
+  fn = alloc_printf("%s/interesting-traces", out_dir);
   if (delete_files(fn, "")) goto dir_cleanup_failed;
   ck_free(fn);
 
@@ -5763,6 +5844,9 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
   /* This handles FAULT_ERROR for us: */
 
   queued_discovered += save_if_interesting(argv, out_buf, len, fault);
+
+  if (extern_usage && (fault == FAULT_TMOUT || fault == FAULT_CRASH))
+    stop_soon = 2;
 
   if (!(stage_cur % stats_update_freq) || stage_cur + 1 == stage_max)
     show_stats();
@@ -8521,6 +8605,12 @@ EXP_ST void setup_dirs_fds(void) {
   if (mkdir(tmp, 0700)) PFATAL("Unable to create '%s'", tmp);
   ck_free(tmp);
 
+  /* Recorded traces for all interesting inputs. */
+
+  tmp = alloc_printf("%s/interesting-traces", out_dir);
+  if (mkdir(tmp, 0700)) PFATAL("Unable to create '%s'", tmp);
+  ck_free(tmp);
+
   /* Generally useful file descriptors. */
 
   dev_null_fd = open("/dev/null", O_RDWR);
@@ -9281,6 +9371,12 @@ void *afl_main(void* arg) {
         extern_usage = 1;
         break;
 
+      case 'Y': /* output every new interesting input and its trace */
+
+        if (trace_interesting) FATAL("Multiple -Y options not supported");
+        trace_interesting = 1;
+        break;
+
       case 'Z': /* trace repeated calibration runs */
 
         if (trace_calibration) FATAL("Multiple -Z options not supported");
@@ -9396,6 +9492,9 @@ void *afl_main(void* arg) {
         } else if (!strcmp(optarg, "ETHERNET")) {
           extract_requests = &extract_requests_ethernet;
           extract_response_codes = &extract_response_codes_ethernet;
+        } else if (!strcmp(optarg, "MODBUS")) {
+          extract_requests = &extract_requests_modbus;
+          extract_response_codes = &extract_response_codes_modbus;
         } else {
           FATAL("%s protocol is not supported yet!", optarg);
         }
@@ -9829,7 +9928,7 @@ void *afl_main(void* arg) {
       if (forksrv_pid > 0) kill(forksrv_pid, SIGKILL);
   }
   /* Now that we've killed the forkserver, we wait for it to be able to get rusage stats. */
-  if (waitpid(forksrv_pid, NULL, 0) <= 0) {
+  if (!extern_usage && waitpid(forksrv_pid, NULL, 0) <= 0) {
     WARNF("error waitpid\n");
   }
 

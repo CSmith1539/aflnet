@@ -2,19 +2,15 @@
 #include "aflnet.h"
 #include "afl-fastdyn.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
-#include <time.h>
 #include <stdbool.h>
 #include <fcntl.h>
-#include <immintrin.h>
 #include <unistd.h>
 #include <poll.h>
 #include <errno.h>
 #include <sys/mman.h>
-#include <sys/eventfd.h>
-
-#define FASTDYN_SHM_NAME      "/fastdyn_fuzzer_fd"
-#define FASTDYN_LOOP_SHM_NAME "/fastdyn_loop_fd"
+#include <sys/shm.h>
 
 static int get_fd_from_shm(const char *name) {
     int sfd = shm_open(name, O_RDONLY, 0);
@@ -31,293 +27,198 @@ static int get_fuzzer_fd(void) {
     static int cached = -1;
     if (cached >= 0) return cached;
     cached = get_fd_from_shm(FASTDYN_SHM_NAME);
-    if (cached < 0) perror("[fastdyn] shm_open failed — model not yet initialised?");
+    if (cached < 0) perror("[fastdyn] shm_open failed - model not yet initialised?");
     return cached;
 }
 
-/* fd for the eventfd written by fuzz_eth_in on every entry into the firmware
- * input loop.  Cached on first use, same as get_fuzzer_fd(). */
-static int get_loop_fd(void) {
-    static int cached = -1;
-    if (cached >= 0) return cached;
-    cached = get_fd_from_shm(FASTDYN_LOOP_SHM_NAME);
-    return cached;
-}
+typedef struct pending_frame {
+    struct pending_frame *next;
+    size_t len;
+    uint8_t data[];
+} pending_frame_t;
 
-static fastdyn_sync_state_t *get_sync_state(void) {
-    static fastdyn_sync_state_t *cached = NULL;
+static pending_frame_t *g_pending_head;
+static pending_frame_t *g_pending_tail;
+static uint64_t g_next_seq;
+static uint8_t g_wire_buf[sizeof(fastdyn_msg_hdr_t) + FASTDYN_MAX_FRAME];
 
-    if (cached) return cached;
+static int queue_response(const uint8_t *data, size_t len)
+{
+    pending_frame_t *node = malloc(sizeof(*node) + len);
+    if (!node) return -1;
 
-    int sfd = shm_open(FASTDYN_SYNC_SHM_NAME, O_RDWR, 0);
-    if (sfd < 0) return NULL;
+    node->next = NULL;
+    node->len = len;
+    if (len != 0) memcpy(node->data, data, len);
 
-    cached = mmap(NULL, sizeof(*cached), PROT_READ | PROT_WRITE,
-                  MAP_SHARED, sfd, 0);
-    close(sfd);
-
-    if (cached == MAP_FAILED) {
-        cached = NULL;
-        return NULL;
+    if (g_pending_tail) {
+        g_pending_tail->next = node;
+    } else {
+        g_pending_head = node;
     }
-
-    return cached;
+    g_pending_tail = node;
+    return 0;
 }
 
-static void drain_eventfd(int efd) {
-    if (efd < 0) return;
+static int pop_response(uint8_t *buffer, size_t size)
+{
+    pending_frame_t *node = g_pending_head;
+    if (!node) return 0;
 
-    while (1) {
-        uint64_t dummy;
-        ssize_t n = read(efd, &dummy, sizeof(dummy));
-        if (n == (ssize_t)sizeof(dummy)) continue;
-        break;
-    }
+    size_t copy_len = node->len < size ? node->len : size;
+    if (copy_len != 0) memcpy(buffer, node->data, copy_len);
+
+    g_pending_head = node->next;
+    if (!g_pending_head) g_pending_tail = NULL;
+    free(node);
+    return (int)copy_len;
 }
 
-/*
- * fastdyn_send — inject one Ethernet frame into the model's RX path, then
- * wait up to timeout_ms for the firmware to finish processing it.
- *
- * Drains loop_evt_fd before injecting so that any eventfd count left from a
- * previous round is cleared. After write(), poll waits for loop_evt_fd only:
- * response availability on the data socket does not mean the firmware has
- * returned to fuzz_eth_in() and is safe for the next input yet.
- *
- * poll() intentionally does not consume the eventfd; fastdyn_recv() drains
- * the queued response frames first, then consumes the loop signal once the
- * response queue is empty.
- *
- * Returns:
- *   >= 0  bytes written, firmware acknowledged within timeout_ms
- *   -2    write succeeded but firmware did not return within timeout_ms (hang)
- *   -1    write failed
- */
-int fastdyn_send(uint8_t *input, size_t size, uint32_t timeout_ms) {
-    int fd  = get_fuzzer_fd();
+static int send_msg(fastdyn_msg_type_t type,
+                    uint64_t seq,
+                    const uint8_t *data,
+                    size_t len)
+{
+    int fd = get_fuzzer_fd();
+    if (fd < 0 || len > FASTDYN_MAX_FRAME) return -1;
+
+    size_t total = sizeof(fastdyn_msg_hdr_t) + len;
+    uint8_t *packet = malloc(total);
+    if (!packet) return -1;
+
+    fastdyn_msg_hdr_t hdr = {
+        .magic = FASTDYN_MSG_MAGIC,
+        .type = (uint32_t)type,
+        .seq = seq,
+        .len = (uint32_t)len,
+    };
+
+    memcpy(packet, &hdr, sizeof(hdr));
+    if (len != 0) memcpy(packet + sizeof(hdr), data, len);
+
+    ssize_t written = write(fd, packet, total);
+    free(packet);
+
+    return written == (ssize_t)total ? (int)len : -1;
+}
+
+static int recv_msg(int timeout_ms, fastdyn_msg_hdr_t *hdr, uint8_t **payload)
+{
+    int fd = get_fuzzer_fd();
     if (fd < 0) return -1;
-    int lfd = get_loop_fd();
-    fastdyn_sync_state_t *sync = get_sync_state();
-    uint64_t expected = 0;
 
-    /* Drain any stale eventfd count so only signals from this round unblock us. */
-    if (sync) {
-        expected = atomic_load_explicit(&sync->tx_seq, memory_order_relaxed) + 1;
-        atomic_store_explicit(&sync->tx_seq, expected, memory_order_release);
-    }
-    drain_eventfd(lfd);
-
-    ssize_t n = write(fd, input, size);
-    if (n < 0) {
-        if (sync)
-            atomic_store_explicit(&sync->tx_seq, expected - 1, memory_order_release);
-        printf("[fastdyn_send] failed to write - %zd\n", n);
-        fprintf(stderr, "errno=%d\n", errno);
-        return -1;
-    }
-
-    if (!sync || lfd < 0) {
-        struct pollfd pfd = { .fd = lfd, .events = POLLIN };
-        int rv;
-
-        if (lfd < 0) return (int)n;
-
-        rv = poll(&pfd, 1, (int)timeout_ms);
-        if (rv == 0) return -2; /* timeout — firmware still processing */
-        if (rv < 0) return -1;
-
-        return (int)n;
-    }
-
-    while (atomic_load_explicit(&sync->ack_seq, memory_order_acquire) < expected) {
-        struct pollfd pfd = { .fd = lfd, .events = POLLIN };
+    while (true) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
         int rv = poll(&pfd, 1, (int)timeout_ms);
 
-        if (rv == 0) return -2; /* timeout — firmware still processing */
+        if (rv == 0) return 0;
         if (rv < 0) {
             if (errno == EINTR) continue;
             return -1;
         }
 
-        if (atomic_load_explicit(&sync->ack_seq, memory_order_acquire) >= expected)
-            break;
-
-        /* Woken by an older unread signal: drain and keep waiting for the
-         * ack_seq that corresponds to this specific packet. */
-        drain_eventfd(lfd);
-    }
-
-    return (int)n;
-}
-
-/*
- * fastdyn_recv — collect one Ethernet frame the firmware transmitted, or
- * detect that the firmware is back in the input loop without sending one.
- *
- * Polls both the data socketpair and loop_evt_fd.  Data takes priority: if
- * the data fd is readable, a response frame is available and is returned.
- * If only loop_evt_fd is readable, the firmware re-entered the input loop
- * without sending a response (frame dropped); the eventfd is consumed and
- * 0 is returned.  This makes every fastdyn_recv call after a send terminate
- * cleanly without timing out, even when aflnet calls recv multiple times.
- *
- * Returns:
- *   >0   response frame read into buffer
- *    0   loop signal received — firmware done, no response frame (drop)
- *   -1   error (fd unavailable, read error)
- *   -2   poll timed out — firmware did not respond within timeout_ms (hang)
- */
-int fastdyn_recv(uint8_t *buffer, size_t size, uint32_t timeout_ms) {
-    int fd  = get_fuzzer_fd();
-    if (fd < 0) return -1;
-    int lfd = get_loop_fd();
-
-    struct pollfd pfds[2];
-    int nfds = 0;
-    pfds[nfds++] = (struct pollfd){ .fd = fd,  .events = POLLIN };
-    if (lfd >= 0)
-        pfds[nfds++] = (struct pollfd){ .fd = lfd, .events = POLLIN };
-
-    int rv = poll(pfds, nfds, (int)timeout_ms);
-    if (rv == 0) return -2; /* poll timed out — hang */
-    if (rv < 0)  return -1; /* signal or error */
-
-    /* Prefer a real response frame over the loop signal. */
-    if (pfds[0].revents & POLLIN) {
-        ssize_t n = read(fd, buffer, size);
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return -1;
-        return (int)n;
-    }
-
-    /* Loop signal: firmware is back in the input loop, no response frame. */
-    if (lfd >= 0) {
-        uint64_t val;
-        read(lfd, &val, sizeof(val)); /* consume so the next round starts clean */
-    }
-    return 0;
-}
-
-/*
- * Restore firmware memory to a previously captured snapshot.
- * Returns 0 on success, -1 on invalid handle or restore failure.
- */
-extern int g_snap_done_fd;
-int fastdyn_snap_restore() {
-    int fd = get_fuzzer_fd();
-    if (fd < 0) return -1;
-
-    /* Raw write — don't use fastdyn_send() here.  fastdyn_send() returns as
-     * soon as loop_evt_fd fires (firmware entered the input hook), which
-     * happens *before* the snapshot message is read and the restore runs.
-     * We need to wait until the restore is fully done, not just until the
-     * hook fires. */
-    uint32_t snapshot_msg = 0x13243546;
-    write(fd, &snapshot_msg, sizeof(snapshot_msg));
-
-    /* Block until fuzz_snap_handler() writes g_snap_done_fd after the
-     * restore completes.  No poll needed — blocking eventfd sleeps until
-     * exactly one write arrives. */
-    if (g_snap_done_fd >= 0) {
-        uint64_t val;
-        read(g_snap_done_fd, &val, sizeof(val));
-    }
-
-    return 0;
-}
-
-
-/*
- * fastdyn_trace_replay — replay one aflnet-format seed file on a loop until
- * fuzz_trace_compare() (called inside fuzz_snap_handler) finds a divergence.
- *
- * The seed file is the same raw concatenated Ethernet frame format used by
- * the fuzzer queue: back-to-back frames with boundaries determined by the
- * Ethernet/IP total-length fields (parsed by extract_requests_ethernet).
- * Each frame is injected individually via fastdyn_send/fastdyn_recv, matching
- * the per-message loop in send_over_fastdyn(), so the firmware sees exactly
- * the same packet sequence it would see during normal fuzzing.
- *
- * Usage:
- *   FASTDYN_TRACE_SEED=/path/to/afl-out/queue/id:000042 fastdyn run ...
- */
-void fastdyn_trace_replay(const char *seed_path) {
-    FILE *f = fopen(seed_path, "rb");
-    if (!f) { perror("[trace] fopen seed"); return; }
-
-    fseek(f, 0, SEEK_END);
-    long file_sz = ftell(f);
-    rewind(f);
-    if (file_sz <= 0) { fclose(f); fprintf(stderr, "[trace] empty seed\n"); return; }
-
-    uint8_t *seed = malloc((size_t)file_sz);
-    if (!seed) { fclose(f); perror("[trace] malloc"); return; }
-    if (fread(seed, 1, (size_t)file_sz, f) != (size_t)file_sz) {
-        fclose(f); free(seed);
-        fprintf(stderr, "[trace] short read\n"); return;
-    }
-    fclose(f);
-
-    /* Split the seed into individual Ethernet frames using the same parser
-     * that the main fuzzer loop uses. */
-    unsigned int region_count = 0;
-    region_t *regions = extract_requests_ethernet(seed, (unsigned int)file_sz,
-                                                  &region_count);
-    if (!regions || region_count == 0) {
-        fprintf(stderr, "[trace] extract_requests_ethernet found no frames\n");
-        free(seed);
-        return;
-    }
-
-    printf("[trace] Replaying '%s': %u frame(s), %ld bytes — running until divergence.\n",
-           seed_path, region_count, file_sz);
-
-    uint8_t recv_buf[2048];
-    uint32_t run = 0;
-
-    while (1) {
-        /* Send each frame in order, draining the response after each one —
-         * identical to the inner loop of send_over_fastdyn(). */
-        for (unsigned int i = 0; i < region_count; i++) {
-            uint8_t  *frame     = seed + regions[i].start_byte;
-            uint32_t  frame_len = (uint32_t)(regions[i].end_byte
-                                             - regions[i].start_byte + 1);
-            //printf("Injecting number %d\n", i);
-
-            // printf("[trace] sending frame size %u:");
-            // for (uint32_t i = 0; i < frame_len; i++) {
-            //     printf(" %02x", frame[i]);
-            // }
-            // printf("\n");
-
-            int rc = fastdyn_send(frame, frame_len, 5000);
-            //printf("[trace] injected frame\n");
-            if (rc == -2) {
-                fprintf(stderr, "[trace] fastdyn_send timed out on frame %u, run %u\n",
-                        i, run);
-                goto next_run;
-            }
-            if (rc < 0) {
-                fprintf(stderr, "Skipping this run, len = %u, ret = %d\n", frame_len, rc);
-                goto next_run;
-            }
-
-            /* Drain any response frame the firmware produced. */
-            fastdyn_recv(recv_buf, sizeof(recv_buf), 500);
+        ssize_t rd = read(fd, g_wire_buf, sizeof(g_wire_buf));
+        if (rd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            if (errno == EINTR) continue;
+            return -1;
         }
 
-next_run:
-        /* Trigger snapshot restore.  fuzz_snap_handler fires in the plugin
-         * thread, calls fuzz_trace_compare(), and exits on divergence. */
-        fastdyn_snap_restore();
-        run++;
-        printf("[trace] Run %u complete — identical so far.\n", run);
+        if (rd < (ssize_t)sizeof(*hdr)) return -1;
+
+        memcpy(hdr, g_wire_buf, sizeof(*hdr));
+        if (hdr->magic != FASTDYN_MSG_MAGIC ||
+            hdr->len > FASTDYN_MAX_FRAME ||
+            rd != (ssize_t)(sizeof(*hdr) + hdr->len)) {
+            return -1;
+        }
+
+        *payload = g_wire_buf + sizeof(*hdr);
+        return 1;
+    }
+}
+
+/*
+ * fastdyn_send — inject one frame into the model's RX path, then
+ * wait up to timeout_ms for the firmware to finish processing it.
+ */
+int fastdyn_send(uint8_t *input, size_t size, uint32_t timeout_ms) {
+    if (input == NULL) return -1;
+
+    if (size > FASTDYN_MAX_FRAME) {
+        size = FASTDYN_MAX_FRAME;
     }
 
-    /* Unreachable (exit(0) fires inside fastdyn_trace_compare on divergence),
-     * but free cleanly in case the loop is ever broken out of. */
-    free(regions);
-    free(seed);
+    uint64_t seq = ++g_next_seq;
+    int n = send_msg(FASTDYN_MSG_INPUT, seq, input, size);
+    if (n < 0) {
+        return -1;
+    }
+
+    while (true) {
+        fastdyn_msg_hdr_t hdr;
+        uint8_t *payload = NULL;
+        int rv = recv_msg((int)timeout_ms, &hdr, &payload);
+
+        if (rv == 0) return -2;
+        if (rv < 0) return -1;
+
+        if (hdr.type == FASTDYN_MSG_RESPONSE) {
+            if (queue_response(payload, hdr.len) < 0) return -1;
+        } else if (hdr.type == FASTDYN_MSG_DONE && hdr.seq == seq) {
+            return n;
+        }
+    }
 }
+
+/*
+ * fastdyn_recv — collect one queued firmware response frame.
+ */
+int fastdyn_recv(uint8_t *buffer, size_t size, uint32_t timeout_ms) {
+    if (buffer == NULL || size == 0) return -1;
+
+    int queued = pop_response(buffer, size);
+    if (queued > 0) return queued;
+
+    fastdyn_msg_hdr_t hdr;
+    uint8_t *payload = NULL;
+    int rv = recv_msg((int)timeout_ms, &hdr, &payload);
+
+    if (rv == 0) return -2;
+    if (rv < 0) return -1;
+
+    if (hdr.type == FASTDYN_MSG_RESPONSE) {
+        size_t copy_len = hdr.len < size ? hdr.len : size;
+        if (copy_len != 0) memcpy(buffer, payload, copy_len);
+        return (int)copy_len;
+    }
+
+    if (hdr.type == FASTDYN_MSG_DONE) return 0;
+    return -2;
+}
+
+int fastdyn_snap_restore() {
+    uint64_t seq = ++g_next_seq;
+    if (send_msg(FASTDYN_MSG_RESTORE, seq, NULL, 0) < 0) {
+        return -1;
+    }
+
+    while (true) {
+        fastdyn_msg_hdr_t hdr;
+        uint8_t *payload = NULL;
+        int rv = recv_msg(-1, &hdr, &payload);
+
+        if (rv < 0) return -1;
+        if (rv == 0) continue;
+
+        if (hdr.type == FASTDYN_MSG_RESPONSE) {
+            if (queue_response(payload, hdr.len) < 0) return -1;
+        } else if (hdr.type == FASTDYN_MSG_RESTORE_DONE) {
+            return 0;
+        }
+    }
+}
+
 
 /* -------------------------------------------------------------------------
  * TCP protocol extractors

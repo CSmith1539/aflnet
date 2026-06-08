@@ -4,22 +4,32 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdio.h>
-#include <stdatomic.h>
 
-#define FASTDYN_SYNC_SHM_NAME "/fastdyn_sync_state"
+#define FASTDYN_SHM_NAME      "/fastdyn_fuzzer_fd"
+#define FASTDYN_MSG_MAGIC     0x4644594eu /* FDYN */
+#define FASTDYN_MAX_FRAME     65536u
 
-#define FASTDYN_TRACE_CAP 16384   /* PCs per run (64 KB per buffer) */
+#define FASTDYN_TRACE_CAP 16384 * 4   /* PCs per run (64 KB per buffer) */
 
 typedef struct {
     uint32_t count;
     uint32_t entries[FASTDYN_TRACE_CAP];
 } fastdyn_trace_run_t;
 
+typedef enum {
+  FASTDYN_MSG_INPUT = 1,
+  FASTDYN_MSG_RESPONSE,
+  FASTDYN_MSG_DONE,
+  FASTDYN_MSG_RESTORE,
+  FASTDYN_MSG_RESTORE_DONE,
+} fastdyn_msg_type_t;
+
 typedef struct {
-  _Atomic uint64_t tx_seq;
-  _Atomic uint64_t ack_seq;
-} fastdyn_sync_state_t;
+  uint32_t magic;
+  uint32_t type;
+  uint64_t seq;
+  uint32_t len;
+} fastdyn_msg_hdr_t;
 
 /* Forward declaration so the extractor signatures compile without pulling in
  * all of aflnet.h (which afl-fuzz.c includes separately before this header). */
@@ -33,15 +43,9 @@ typedef struct {
 } region_t;
 #endif
 
-/* Still used by protocol handlers in lwip_ip.c and fuzz.c. */
-uint32_t fuzz_get_register(int reg);
-void fuzz_set_register(uint32_t value, int reg);
-
-int fuzz_write_memory(unsigned long long addr, uint8_t *mem_buf, int len);
-int fuzz_read_memory(unsigned long long addr, uint8_t *mem_buf, int len);
-
 int fastdyn_send(uint8_t *input, size_t size, uint32_t timeout_ms);
 int fastdyn_recv(uint8_t *buffer, size_t size, uint32_t timeout);
+int fastdyn_snap_restore(void);
 
 /* TCP protocol extractors — plugged into aflnet via -P TCP */
 region_t*     extract_requests_tcp(unsigned char* buf, unsigned int buf_size,

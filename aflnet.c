@@ -2567,6 +2567,320 @@ unsigned int* extract_response_codes_ethernet(unsigned char *buf,
     return state_sequence;
 }
 
+#define MODBUS_MIN_RTU_LEN 4
+#define MODBUS_MAX_RTU_LEN 256
+
+#define MODBUS_STATE_NO_RESPONSE        0x02000000
+#define MODBUS_STATE_MALFORMED          0x02000001
+#define MODBUS_STATE_BAD_CRC            0x02000002
+#define MODBUS_STATE_EXCEPTION_BASE     0x02010000
+#define MODBUS_STATE_NORMAL_BASE        0x02020000
+
+static uint16_t modbus_crc16(const unsigned char *buf, unsigned int len)
+{
+    uint16_t crc = 0xFFFF;
+
+    for (unsigned int pos = 0; pos < len; pos++) {
+        crc ^= (uint16_t)buf[pos];
+
+        for (int i = 0; i < 8; i++) {
+            if (crc & 1)
+                crc = (crc >> 1) ^ 0xA001;
+            else
+                crc >>= 1;
+        }
+    }
+
+    return crc;
+}
+
+static int modbus_rtu_crc_ok(const unsigned char *buf, unsigned int len)
+{
+    if (len < MODBUS_MIN_RTU_LEN)
+        return 0;
+
+    uint16_t calc = modbus_crc16(buf, len - 2);
+    uint16_t got  = (uint16_t)buf[len - 2] | ((uint16_t)buf[len - 1] << 8);
+
+    return calc == got;
+}
+
+/* Return expected Modbus RTU request frame length from buf[offset].
+ * Returns 0 if incomplete or not safely parseable.
+ */
+static unsigned int modbus_rtu_request_len(unsigned char *buf,
+                                           unsigned int offset,
+                                           unsigned int buf_size)
+{
+    unsigned int rem = buf_size - offset;
+
+    if (rem < MODBUS_MIN_RTU_LEN)
+        return 0;
+
+    unsigned char func = buf[offset + 1];
+
+    switch (func) {
+    case 0x01: /* Read Coils */
+    case 0x02: /* Read Discrete Inputs */
+    case 0x03: /* Read Holding Registers */
+    case 0x04: /* Read Input Registers */
+    case 0x05: /* Write Single Coil */
+    case 0x06: /* Write Single Register */
+        return rem >= 8 ? 8 : 0;
+
+    case 0x0F: /* Write Multiple Coils */
+    case 0x10: { /* Write Multiple Registers */
+        if (rem < 9)
+            return 0;
+
+        unsigned int byte_count = buf[offset + 6];
+        unsigned int len = 1 + 1 + 2 + 2 + 1 + byte_count + 2;
+
+        if (len > MODBUS_MAX_RTU_LEN)
+            return 0;
+
+        return rem >= len ? len : 0;
+    }
+
+    case 0x07: /* Read Exception Status */
+    case 0x11: /* Report Server ID */
+        return rem >= 4 ? 4 : 0;
+
+    default:
+        /* Unknown function: minimum possible RTU frame.
+         * For fuzzing, treat rest as one region if no known length exists.
+         */
+        return 0;
+    }
+}
+
+region_t* extract_requests_modbus(unsigned char *buf,
+                                  unsigned int buf_size,
+                                  unsigned int *region_count_ref)
+{
+    unsigned int region_count = 0;
+    region_t *regions = NULL;
+    unsigned int offset = 0;
+
+    while (offset < buf_size) {
+        unsigned int flen = modbus_rtu_request_len(buf, offset, buf_size);
+
+        if (flen == 0)
+            break;
+
+        region_count++;
+        regions = (region_t *)ck_realloc(regions,
+                                          region_count * sizeof(region_t));
+
+        regions[region_count - 1].start_byte = offset;
+        regions[region_count - 1].end_byte = offset + flen - 1;
+        regions[region_count - 1].state_sequence = NULL;
+        regions[region_count - 1].state_count = 0;
+
+        offset += flen;
+    }
+
+    /* Fallback: keep AFLNet from discarding odd/nonconforming inputs. */
+    if (region_count == 0 && buf_size > 0) {
+        regions = (region_t *)ck_realloc(regions, sizeof(region_t));
+        regions[0].start_byte = 0;
+        regions[0].end_byte = buf_size - 1;
+        regions[0].state_sequence = NULL;
+        regions[0].state_count = 0;
+        region_count = 1;
+    }
+
+    *region_count_ref = region_count;
+    return regions;
+}
+
+/* Return expected Modbus RTU response frame length from buf[offset].
+ * Responses differ from requests:
+ *   read responses: [addr][func][byte_count][data...][crc_lo][crc_hi]
+ *   write responses: usually 8 bytes
+ *   exception: [addr][func|0x80][exception][crc_lo][crc_hi]
+ */
+static unsigned int modbus_rtu_response_len(unsigned char *buf,
+                                            unsigned int offset,
+                                            unsigned int buf_size)
+{
+    unsigned int rem = buf_size - offset;
+
+    if (rem < MODBUS_MIN_RTU_LEN)
+        return 0;
+
+    unsigned char func = buf[offset + 1];
+
+    if (func & 0x80) {
+        return rem >= 5 ? 5 : 0;
+    }
+
+    switch (func) {
+    case 0x01:
+    case 0x02:
+    case 0x03:
+    case 0x04: {
+        if (rem < 5)
+            return 0;
+
+        unsigned int byte_count = buf[offset + 2];
+        unsigned int len = 1 + 1 + 1 + byte_count + 2;
+
+        if (len > MODBUS_MAX_RTU_LEN)
+            return 0;
+
+        return rem >= len ? len : 0;
+    }
+
+    case 0x05:
+    case 0x06:
+    case 0x0F:
+    case 0x10:
+        return rem >= 8 ? 8 : 0;
+
+    case 0x07:
+        return rem >= 5 ? 5 : 0;
+
+    case 0x11: {
+        if (rem < 5)
+            return 0;
+
+        unsigned int byte_count = buf[offset + 2];
+        unsigned int len = 1 + 1 + 1 + byte_count + 2;
+
+        if (len > MODBUS_MAX_RTU_LEN)
+            return 0;
+
+        return rem >= len ? len : 0;
+    }
+
+    default:
+        return 0;
+    }
+}
+
+unsigned int* extract_response_codes_modbus(unsigned char *buf,
+                                            unsigned int buf_size,
+                                            unsigned int *state_count_ref)
+{
+    unsigned int *state_sequence = NULL;
+    unsigned int state_count = 0;
+    unsigned int offset = 0;
+
+    /* Initial AFLNet state. */
+    state_count++;
+    state_sequence = (unsigned int *)ck_realloc(
+        state_sequence,
+        state_count * sizeof(unsigned int)
+    );
+    state_sequence[state_count - 1] = 0;
+
+    if (buf_size == 0) {
+        state_count++;
+        state_sequence = (unsigned int *)ck_realloc(
+            state_sequence,
+            state_count * sizeof(unsigned int)
+        );
+        state_sequence[state_count - 1] =
+            get_mapped_message_code(MODBUS_STATE_NO_RESPONSE);
+
+        *state_count_ref = state_count;
+        return state_sequence;
+    }
+
+    while (offset < buf_size) {
+        unsigned int flen = modbus_rtu_response_len(buf, offset, buf_size);
+
+        unsigned int raw_code = 0;
+
+        if (flen == 0) {
+            raw_code = MODBUS_STATE_MALFORMED;
+
+            state_count++;
+            state_sequence = (unsigned int *)ck_realloc(
+                state_sequence,
+                state_count * sizeof(unsigned int)
+            );
+            state_sequence[state_count - 1] = get_mapped_message_code(raw_code);
+            break;
+        }
+
+        unsigned char addr = buf[offset + 0];
+        unsigned char func = buf[offset + 1];
+
+        if (!modbus_rtu_crc_ok(buf + offset, flen)) {
+            raw_code = MODBUS_STATE_BAD_CRC;
+        } else if (func & 0x80) {
+            unsigned char original_func = func & 0x7F;
+            unsigned char exception_code = buf[offset + 2];
+
+            raw_code =
+                MODBUS_STATE_EXCEPTION_BASE |
+                ((unsigned int)addr << 16) |
+                ((unsigned int)original_func << 8) |
+                exception_code;
+        } else {
+            unsigned int shape = 0;
+
+            switch (func) {
+            case 0x01:
+            case 0x02:
+            case 0x03:
+            case 0x04:
+                /* Bucket read responses by byte_count. */
+                shape = buf[offset + 2];
+                break;
+
+            case 0x05:
+            case 0x06:
+                /* Single write echo. */
+                shape = 0;
+                break;
+
+            case 0x0F:
+            case 0x10: {
+                /* Multiple write response echoes start + quantity.
+                 * Bucket these so every address does not become a new state.
+                 */
+                unsigned int start =
+                    ((unsigned int)buf[offset + 2] << 8) |
+                    ((unsigned int)buf[offset + 3]);
+
+                unsigned int qty =
+                    ((unsigned int)buf[offset + 4] << 8) |
+                    ((unsigned int)buf[offset + 5]);
+
+                shape = ((start / 16) & 0x0F) << 4;
+                shape |= qty & 0x0F;
+                break;
+            }
+
+            default:
+                shape = 0;
+                break;
+            }
+
+            raw_code =
+                MODBUS_STATE_NORMAL_BASE |
+                ((unsigned int)addr << 16) |
+                ((unsigned int)func << 8) |
+                (shape & 0xFF);
+        }
+
+        state_count++;
+        state_sequence = (unsigned int *)ck_realloc(
+            state_sequence,
+            state_count * sizeof(unsigned int)
+        );
+        state_sequence[state_count - 1] = get_mapped_message_code(raw_code);
+
+        offset += flen;
+    }
+
+    *state_count_ref = state_count;
+    return state_sequence;
+}
+
 // kl_messages manipulating functions
 
 klist_t(lms) *construct_kl_messages(u8* fname, region_t *regions, u32 region_count)
