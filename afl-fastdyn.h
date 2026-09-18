@@ -9,11 +9,12 @@
 #define FASTDYN_MSG_MAGIC     0x4644594eu /* FDYN */
 #define FASTDYN_MAX_FRAME     65536u
 
-#define FASTDYN_TRACE_CAP 16384 * 4   /* PCs per run (64 KB per buffer) */
+#define FASTDYN_TRACE_INITIAL_CAP (16384 * 4)   /* Initial PCs per run. */
 
 typedef struct {
     uint32_t count;
-    uint32_t entries[FASTDYN_TRACE_CAP];
+    uint32_t capacity;
+    uint32_t *entries;
 } fastdyn_trace_run_t;
 
 typedef enum {
@@ -43,9 +44,12 @@ typedef struct {
 } region_t;
 #endif
 
+/* Attach the datagram endpoint supplied by the in-process FastDyn bridge. */
+int fastdyn_attach_fd(int fd);
+
 int fastdyn_send(uint8_t *input, size_t size, uint32_t timeout_ms);
 int fastdyn_recv(uint8_t *buffer, size_t size, uint32_t timeout);
-int fastdyn_snap_restore(void);
+int fastdyn_snap_restore(uint32_t timeout_ms);
 
 /* TCP protocol extractors — plugged into aflnet via -P TCP */
 region_t*     extract_requests_tcp(unsigned char* buf, unsigned int buf_size,
@@ -57,7 +61,7 @@ unsigned int* extract_response_codes_tcp(unsigned char* buf, unsigned int buf_si
 void fastdyn_snap_free();
 
 /* Exported from fuzz_trace.c — used by -Z dry-run trace mode in afl-fuzz.c */
-void fuzz_trace_enable(void);
+void fuzz_trace_enable(int max_entries);
 void fuzz_trace_reset(void);
 
 #endif

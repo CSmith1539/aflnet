@@ -1,3 +1,5 @@
+#include <sys/time.h>
+
 #include "types.h"
 #include "aflnet.h"
 #include "afl-fastdyn.h"
@@ -23,12 +25,26 @@ static int get_fd_from_shm(const char *name) {
     return fd;
 }
 
+static int g_attached_fd = -1;
+
 static int get_fuzzer_fd(void) {
     static int cached = -1;
+    if (g_attached_fd >= 0) return g_attached_fd;
     if (cached >= 0) return cached;
     cached = get_fd_from_shm(FASTDYN_SHM_NAME);
     if (cached < 0) perror("[fastdyn] shm_open failed - model not yet initialised?");
     return cached;
+}
+
+int fastdyn_attach_fd(int fd)
+{
+    if (fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    g_attached_fd = fd;
+    return 0;
 }
 
 typedef struct pending_frame {
@@ -72,6 +88,16 @@ static int pop_response(uint8_t *buffer, size_t size)
     if (!g_pending_head) g_pending_tail = NULL;
     free(node);
     return (int)copy_len;
+}
+
+static void clear_responses(void)
+{
+    while (g_pending_head) {
+        pending_frame_t *node = g_pending_head;
+        g_pending_head = node->next;
+        free(node);
+    }
+    g_pending_tail = NULL;
 }
 
 static int send_msg(fastdyn_msg_type_t type,
@@ -163,7 +189,7 @@ int fastdyn_send(uint8_t *input, size_t size, uint32_t timeout_ms) {
         if (rv == 0) return -2;
         if (rv < 0) return -1;
 
-        if (hdr.type == FASTDYN_MSG_RESPONSE) {
+        if (hdr.type == FASTDYN_MSG_RESPONSE && hdr.seq == seq) {
             if (queue_response(payload, hdr.len) < 0) return -1;
         } else if (hdr.type == FASTDYN_MSG_DONE && hdr.seq == seq) {
             return n;
@@ -197,7 +223,7 @@ int fastdyn_recv(uint8_t *buffer, size_t size, uint32_t timeout_ms) {
     return -2;
 }
 
-int fastdyn_snap_restore() {
+int fastdyn_snap_restore(uint32_t timeout_ms) {
     uint64_t seq = ++g_next_seq;
     if (send_msg(FASTDYN_MSG_RESTORE, seq, NULL, 0) < 0) {
         return -1;
@@ -206,14 +232,15 @@ int fastdyn_snap_restore() {
     while (true) {
         fastdyn_msg_hdr_t hdr;
         uint8_t *payload = NULL;
-        int rv = recv_msg(-1, &hdr, &payload);
+        int rv = recv_msg((int)timeout_ms, &hdr, &payload);
 
         if (rv < 0) return -1;
-        if (rv == 0) continue;
+        if (rv == 0) return -2;
 
         if (hdr.type == FASTDYN_MSG_RESPONSE) {
             if (queue_response(payload, hdr.len) < 0) return -1;
-        } else if (hdr.type == FASTDYN_MSG_RESTORE_DONE) {
+        } else if (hdr.type == FASTDYN_MSG_RESTORE_DONE && hdr.seq == seq) {
+            clear_responses();
             return 0;
         }
     }

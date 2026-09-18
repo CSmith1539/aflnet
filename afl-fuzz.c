@@ -77,13 +77,13 @@
 #endif /* __APPLE__ || __FreeBSD__ || __OpenBSD__ */
 
 #if defined(__GNUC__)
-extern void fuzz_trace_enable(void) __attribute__((weak));
+extern void fuzz_trace_enable(int max_entries) __attribute__((weak));
 extern void fuzz_trace_reset(void) __attribute__((weak));
 extern bool g_trace_enabled __attribute__((weak));
 
 extern fastdyn_trace_run_t g_trace_completed __attribute__((weak));
 #else
-extern void fuzz_trace_enable(void);
+extern void fuzz_trace_enable(int max_entries);
 extern void fuzz_trace_reset(void);
 extern bool g_trace_enabled;
 typedef struct {
@@ -3338,8 +3338,8 @@ static u8 run_target(char** argv, u32 timeout) {
     send_inputs(timeout);
 
     if (!child_timed_out) {
-      int snap_ret = fastdyn_snap_restore();
-      (void)snap_ret;
+      int snap_ret = fastdyn_snap_restore(timeout);
+      if (snap_ret != 0) child_timed_out = 1;
     }
 
     /* No process exit status to collect; fold into normal FAULT_NONE path.
@@ -3586,7 +3586,7 @@ static void start_calibration_trace(void) {
     FATAL("-Z requires FastDyn trace hooks");
 
   fuzz_trace_reset();
-  fuzz_trace_enable();
+  fuzz_trace_enable(-1);
 }
 
 static void stop_calibration_trace(void) {
@@ -4282,7 +4282,7 @@ static void trace_interesting_capture_trace(char** argv, const char* desc) {
   stage_max  = 1;
 
   fuzz_trace_reset();
-  fuzz_trace_enable();
+  fuzz_trace_enable(-1);
 
   fault = run_target(argv, exec_tmout);
 
@@ -9444,6 +9444,9 @@ void *afl_main(void* arg) {
         } else if (!strcmp(optarg, "MQTT")) {
           extract_requests = &extract_requests_mqtt;
           extract_response_codes = &extract_response_codes_mqtt;
+        } else if (!strcmp(optarg, "MQTT_CLIENT")) {
+          extract_requests = &extract_requests_mqtt_client;
+          extract_response_codes = &extract_response_codes_mqtt_client;
         } else if (!strcmp(optarg, "DTLS12")) {
           extract_requests = &extract_requests_dtls12;
           extract_response_codes = &extract_response_codes_dtls12;

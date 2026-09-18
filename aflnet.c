@@ -991,6 +991,137 @@ region_t* extract_requests_ftp(unsigned char* buf, unsigned int buf_size, unsign
   return regions;
 }
 
+
+/*
+ * MQTT client variant for FastDyn: the firmware receives broker packets but
+ * emits client packets.  AFLNet therefore annotates each seed message with
+ * the complete outgoing client packet type observed after it is delivered.
+ * MQTT remaining length is a base-128 varint, so use it for both framing and
+ * state extraction instead of assuming a one-byte length.
+ */
+#define MQTT_CLIENT_STATE_BASE      0x03000000u
+#define MQTT_CLIENT_STATE_MALFORMED 0x0300ffffu
+
+static unsigned int mqtt_client_packet_len(const unsigned char *buf,
+                                           unsigned int offset,
+                                           unsigned int buf_size)
+{
+    unsigned int remaining = 0;
+    unsigned int multiplier = 1;
+    unsigned int encoded_bytes = 0;
+
+    if (offset + 2 > buf_size) {
+        return 0;
+    }
+
+    for (unsigned int index = offset + 1;
+         index < buf_size && encoded_bytes < 4;
+         index++, encoded_bytes++) {
+        unsigned int encoded = buf[index];
+        remaining += (encoded & 0x7fu) * multiplier;
+        if ((encoded & 0x80u) == 0) {
+            unsigned int header_len = 1 + encoded_bytes + 1;
+            if (remaining > buf_size - offset - header_len) {
+                return 0;
+            }
+            return header_len + remaining;
+        }
+        multiplier *= 128u;
+    }
+
+    return 0;
+}
+
+static void mqtt_client_append_state(unsigned int **state_sequence,
+                                     unsigned int *state_count,
+                                     unsigned int raw_code)
+{
+    *state_count += 1;
+    *state_sequence = (unsigned int *)ck_realloc(
+        *state_sequence, *state_count * sizeof(unsigned int));
+    (*state_sequence)[*state_count - 1] =
+        get_mapped_message_code(raw_code);
+}
+
+region_t* extract_requests_mqtt_client(unsigned char *buf,
+                                       unsigned int buf_size,
+                                       unsigned int *region_count_ref)
+{
+    unsigned int region_count = 0;
+    unsigned int offset = 0;
+    region_t *regions = NULL;
+
+    while (offset < buf_size) {
+        unsigned int packet_len = mqtt_client_packet_len(buf, offset, buf_size);
+        if (packet_len == 0) {
+            break;
+        }
+
+        region_count++;
+        regions = (region_t *)ck_realloc(regions,
+                                          region_count * sizeof(region_t));
+        regions[region_count - 1].start_byte = offset;
+        regions[region_count - 1].end_byte = offset + packet_len - 1;
+        regions[region_count - 1].modifiable = 1;
+        regions[region_count - 1].state_sequence = NULL;
+        regions[region_count - 1].state_count = 0;
+        offset += packet_len;
+    }
+
+    /* Preserve malformed candidates as one message; do not silently drop a
+     * valid prefix and make the seed file no longer round-trip. */
+    if (offset != buf_size) {
+        if (regions) {
+            ck_free(regions);
+        }
+        regions = NULL;
+        region_count = 0;
+    }
+
+    if (region_count == 0 && buf_size > 0) {
+        regions = (region_t *)ck_alloc(sizeof(region_t));
+        regions[0].start_byte = 0;
+        regions[0].end_byte = buf_size - 1;
+        regions[0].modifiable = 1;
+        regions[0].state_sequence = NULL;
+        regions[0].state_count = 0;
+        region_count = 1;
+    }
+
+    *region_count_ref = region_count;
+    return regions;
+}
+
+unsigned int* extract_response_codes_mqtt_client(unsigned char *buf,
+                                                  unsigned int buf_size,
+                                                  unsigned int *state_count_ref)
+{
+    unsigned int *state_sequence = NULL;
+    unsigned int state_count = 1;
+    unsigned int offset = 0;
+
+    state_sequence = (unsigned int *)ck_alloc(sizeof(unsigned int));
+    state_sequence[0] = 0;
+
+    while (offset < buf_size) {
+        unsigned int packet_len = mqtt_client_packet_len(buf, offset, buf_size);
+        if (packet_len == 0) {
+            mqtt_client_append_state(&state_sequence, &state_count,
+                                     MQTT_CLIENT_STATE_MALFORMED);
+            break;
+        }
+
+        /* The fixed-header low nibble carries QoS / DUP semantics for
+         * PUBLISH and is useful state information for the MQTT client. */
+        mqtt_client_append_state(&state_sequence, &state_count,
+                                 MQTT_CLIENT_STATE_BASE | buf[offset]);
+        offset += packet_len;
+    }
+
+    *state_count_ref = state_count;
+    return state_sequence;
+}
+
 region_t* extract_requests_mqtt(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
 {
   char *mem;
@@ -2423,6 +2554,12 @@ unsigned int* extract_response_codes_ipp(unsigned char* buf, unsigned int buf_si
 #define ETHERTYPE_IPV4   0x0800
 #define ETHERTYPE_ARP    0x0806
 #define IPPROTO_TCP_VAL  0x06
+#define IPPROTO_UDP_VAL  0x11
+#define IPPROTO_ICMP_VAL 0x01
+#define ETH_STATE_TCP_BASE   0x01010000u
+#define ETH_STATE_UDP        0x01020000u
+#define ETH_STATE_ICMP_BASE  0x01030000u
+#define ETH_STATE_IP_BASE    0x01040000u
 #define ARP_STATE_REQUEST  0x01000001u
 #define ARP_STATE_REPLY    0x01000002u
 
@@ -2442,9 +2579,12 @@ static unsigned int eth_frame_len(const unsigned char *buf,
     //printf("[eth] - ethertype = %x\n", ethertype);
 
     if (ethertype == ETHERTYPE_IPV4) {
-        if (offset + ETH_HEADER_LEN + 4 > buf_size) return 0;
+        if (offset + ETH_HEADER_LEN + 20 > buf_size) return 0;
+        uint8_t ihl = buf[offset + ETH_HEADER_LEN] & 0x0Fu;
+        if (ihl < 5) return 0;
         uint16_t ip_total = ((uint16_t)buf[offset + ETH_HEADER_LEN + 2] << 8) |
                              (uint16_t)buf[offset + ETH_HEADER_LEN + 3];
+        if (ip_total < (uint16_t)ihl * 4u) return 0;
         unsigned int total = (unsigned int)ETH_HEADER_LEN + ip_total;
         if (offset + total > buf_size) return 0;
         return total;
@@ -2476,6 +2616,7 @@ region_t* extract_requests_ethernet(unsigned char *buf,
                                           region_count * sizeof(region_t));
         regions[region_count - 1].start_byte    = offset;
         regions[region_count - 1].end_byte      = offset + flen - 1;
+        regions[region_count - 1].modifiable    = 1;
         regions[region_count - 1].state_sequence = NULL;
         regions[region_count - 1].state_count    = 0;
 
@@ -2486,6 +2627,7 @@ region_t* extract_requests_ethernet(unsigned char *buf,
         regions = (region_t *)ck_realloc(regions, sizeof(region_t));
         regions[0].start_byte    = 0;
         regions[0].end_byte      = buf_size - 1;
+        regions[0].modifiable    = 1;
         regions[0].state_sequence = NULL;
         regions[0].state_count    = 0;
         region_count = 1;
@@ -2529,15 +2671,27 @@ unsigned int* extract_response_codes_ethernet(unsigned char *buf,
             uint8_t ihl      = buf[offset + ETH_HEADER_LEN] & 0x0F;
             uint8_t ip_proto = buf[offset + ETH_HEADER_LEN + 9];
 
-            if (ip_proto == IPPROTO_TCP_VAL) {
-                unsigned int tcp_start = offset + ETH_HEADER_LEN + ihl * 4;
-                /* TCP flags are at byte 13 of the TCP header */
-                if (tcp_start + 14 <= buf_size) {
-                    raw_code = (unsigned int)buf[tcp_start + 13];
+            if (ihl >= 5) {
+                unsigned int ip_end = offset + flen;
+                unsigned int payload_start = offset + ETH_HEADER_LEN + ihl * 4;
+
+                if (ip_proto == IPPROTO_TCP_VAL && payload_start + 14 <= ip_end) {
+                    raw_code = ETH_STATE_TCP_BASE |
+                               (unsigned int)buf[payload_start + 13];
+                    emit = 1;
+                } else if (ip_proto == IPPROTO_UDP_VAL && payload_start + 4 <= ip_end) {
+                    raw_code = ETH_STATE_UDP;
+                    emit = 1;
+                } else if (ip_proto == IPPROTO_ICMP_VAL && payload_start + 2 <= ip_end) {
+                    raw_code = ETH_STATE_ICMP_BASE |
+                               ((unsigned int)buf[payload_start] << 8) |
+                               (unsigned int)buf[payload_start + 1];
+                    emit = 1;
+                } else {
+                    raw_code = ETH_STATE_IP_BASE | (unsigned int)ip_proto;
                     emit = 1;
                 }
             }
-            /* Non-TCP IPv4 frames do not contribute a state event */
 
         } else if (ethertype == ETHERTYPE_ARP) {
             /* ARP opcode is at bytes 6-7 of the ARP payload = frame bytes 20-21 */
@@ -2642,6 +2796,19 @@ static unsigned int modbus_rtu_request_len(unsigned char *buf,
         return rem >= len ? len : 0;
     }
 
+    case 0x17: { /* Read/Write Multiple Registers */
+        if (rem < 13)
+            return 0;
+
+        unsigned int byte_count = buf[offset + 10];
+        unsigned int len = 1 + 1 + 2 + 2 + 2 + 2 + 1 + byte_count + 2;
+
+        if (len > MODBUS_MAX_RTU_LEN)
+            return 0;
+
+        return rem >= len ? len : 0;
+    }
+
     case 0x07: /* Read Exception Status */
     case 0x11: /* Report Server ID */
         return rem >= 4 ? 4 : 0;
@@ -2719,7 +2886,8 @@ static unsigned int modbus_rtu_response_len(unsigned char *buf,
     case 0x01:
     case 0x02:
     case 0x03:
-    case 0x04: {
+    case 0x04:
+    case 0x17: {
         if (rem < 5)
             return 0;
 
@@ -2827,6 +2995,7 @@ unsigned int* extract_response_codes_modbus(unsigned char *buf,
             case 0x02:
             case 0x03:
             case 0x04:
+            case 0x17:
                 /* Bucket read responses by byte_count. */
                 shape = buf[offset + 2];
                 break;
